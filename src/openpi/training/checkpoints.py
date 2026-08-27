@@ -16,6 +16,35 @@ import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
+# File (in the checkpoint directory) that records checkpoint steps which should never be deleted.
+# This is persisted so that checkpoints we resume from are protected across multiple resume sessions,
+# not just the current one.
+_PROTECTED_STEPS_FILE = "protected_steps.txt"
+
+
+def _load_protected_steps(checkpoint_dir: epath.Path) -> set[int]:
+    """Load the set of checkpoint steps that should never be deleted."""
+    path = checkpoint_dir / _PROTECTED_STEPS_FILE
+    if not path.exists():
+        return set()
+    return {int(line) for line in path.read_text().splitlines() if line.strip().isdigit()}
+
+
+def _save_protected_steps(checkpoint_dir: epath.Path, steps: set[int]) -> None:
+    """Persist the set of checkpoint steps that should never be deleted."""
+    path = checkpoint_dir / _PROTECTED_STEPS_FILE
+    path.write_text("\n".join(str(s) for s in sorted(steps)) + "\n")
+
+
+# Bound how many GB of checkpoint data Orbax copies/writes concurrently (param name in the
+# installed orbax is `save_concurrent_gb`). With the default (None = unbounded), Orbax copies
+# the entire ~40GB tree to host memory at once and runs the multi-threaded ocdbt writer flat
+# out -- observed as an ~80GB RAM spike + ~1000% CPU at save time (dominated by fp32 optimizer
+# m,v and EMA params). Capping concurrent GB bounds both peak host memory and the number of
+# busy writer threads. This only affects write buffering/concurrency, NOT the on-disk format
+# (resume-compatible).
+_SAVE_CONCURRENT_GB = 24
+
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
@@ -37,16 +66,43 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # If we're resuming, protect the checkpoint we're resuming from so the CheckpointManager
+    # doesn't delete it during cleanup (e.g. right after the next checkpoint is saved). This
+    # matters when the resumed checkpoint is not a multiple of `keep_period` (e.g. the final
+    # checkpoint of the previous run), since `max_to_keep=1` would otherwise drop it. The
+    # protection is persisted to disk so it survives across multiple resume sessions.
+    should_keep_fn = None
+    if resuming:
+        existing_steps = ocp.utils.checkpoint_steps(checkpoint_dir)
+        if existing_steps:
+            resume_step = max(existing_steps)
+            if resume_step > 0:
+                # Persist the resume step so it is protected now and in future resume sessions.
+                protected_steps = _load_protected_steps(checkpoint_dir)
+                protected_steps.add(resume_step)
+                _save_protected_steps(checkpoint_dir, protected_steps)
+                protected = frozenset(protected_steps)
+
+                def should_keep_fn(step: int) -> bool:
+                    # Keep all previously resumed-from checkpoints, and preserve keep_period behavior.
+                    return step in protected or (keep_period is not None and step % keep_period == 0)
+
+                logging.info(
+                    f"Resuming from checkpoint step {resume_step}; protecting it from deletion "
+                    f"(protected steps: {sorted(protected_steps)})."
+                )
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
             "assets": CallbackHandler(),
-            "train_state": ocp.PyTreeCheckpointHandler(),
-            "params": ocp.PyTreeCheckpointHandler(),
+            "train_state": ocp.PyTreeCheckpointHandler(save_concurrent_gb=_SAVE_CONCURRENT_GB),
+            "params": ocp.PyTreeCheckpointHandler(save_concurrent_gb=_SAVE_CONCURRENT_GB),
         },
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
             keep_period=keep_period,
+            should_keep_fn=should_keep_fn,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
@@ -69,11 +125,18 @@ def save_state(
     step: int,
 ):
     def save_assets(directory: epath.Path):
-        # Save the normalization stats.
+        # Persist the normalization stats with the checkpoint so inference can use exactly
+        # the same stats the model was trained with, independent of code/config changes.
+        # Groot-style configs have asset_id=None, so save at the assets root instead of
+        # under a per-asset subdirectory.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
+        if norm_stats is None:
+            return
+        if data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        else:
+            _normalize.save(directory, norm_stats)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

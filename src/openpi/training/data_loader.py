@@ -15,6 +15,7 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+import openpi.training.groot_openpi_dataset as _groot_openpi_dataset 
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -132,11 +133,30 @@ def create_torch_dataset(
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set. Cannot create dataset.")
+
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    # 1) groot datasets
+    if getattr(data_config, "data_dirs", None):
+        data_dirs = data_config.data_dirs
+        if len(data_dirs) == 1:
+            return _groot_openpi_dataset.GrootOpenpiSingleDataset(
+                dataset_meta=data_dirs[0],
+                action_horizon=action_horizon,
+            )
+        elif len(data_dirs) > 1:
+            return _groot_openpi_dataset.GrootOpenpiMultiDataset(
+                dataset_meta_list=data_dirs,
+                dataset_weights=getattr(data_config, "dataset_weights", None),
+                dataset_weights_alpha=0.4,
+                action_horizon=action_horizon,
+            )
+        else:
+            raise ValueError
+
+    # Standard (openpi) LeRobot dataset loading
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -242,6 +262,22 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if data_config.mixture_configs is not None:
+        return create_mixture_data_loader(
+            data_config.mixture_configs,
+            mixture_weights=data_config.mixture_weights,
+            model_config=config.model,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=config.num_workers,
+            seed=config.seed,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -266,6 +302,70 @@ def create_data_loader(
         skip_norm_stats=skip_norm_stats,
         framework=framework,
     )
+
+
+def create_mixture_data_loader(
+    sub_configs: tuple[_config.DataConfig, ...],
+    *,
+    mixture_weights: tuple[float, ...] | None,
+    model_config: _model.BaseModelConfig,
+    action_horizon: int,
+    batch_size: int,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    skip_norm_stats: bool = False,
+    framework: Literal["jax", "pytorch"] = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a data loader that mixes batches from multiple independent data pipelines.
+
+    Each sub-config is dispatched to its natural loader: RLDS if ``rlds_data_dir`` is set,
+    otherwise the torch/LeRobot loader. On every iteration a batch is drawn from one source
+    according to ``mixture_weights`` (uniform if not provided).
+
+    All sub-loaders must produce batches with the same shape: the same global ``batch_size`` and
+    the same model observation layout (same image views / sequence length), so the jitted train
+    step is not recompiled when the sampled source changes.
+    """
+    if mixture_weights is None:
+        mixture_weights = tuple([1.0 / len(sub_configs)] * len(sub_configs))
+    if len(sub_configs) != len(mixture_weights):
+        raise ValueError("Mixture requires one weight per sub-config.")
+
+    loaders = []
+    for sub_config in sub_configs:
+        if sub_config.rlds_data_dir is not None:
+            loaders.append(
+                create_rlds_data_loader(
+                    sub_config,
+                    action_horizon=action_horizon,
+                    batch_size=batch_size,
+                    sharding=sharding,
+                    shuffle=shuffle,
+                    num_batches=num_batches,
+                    skip_norm_stats=skip_norm_stats,
+                    framework=framework,
+                )
+            )
+        else:
+            loaders.append(
+                create_torch_data_loader(
+                    sub_config,
+                    model_config=model_config,
+                    action_horizon=action_horizon,
+                    batch_size=batch_size,
+                    sharding=sharding,
+                    shuffle=shuffle,
+                    num_batches=num_batches,
+                    num_workers=num_workers,
+                    seed=seed,
+                    skip_norm_stats=skip_norm_stats,
+                    framework=framework,
+                )
+            )
+    return MixtureDataLoader(loaders, mixture_weights, seed)
 
 
 def create_torch_data_loader(
@@ -525,6 +625,41 @@ class RLDSDataLoader:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+
+
+class MixtureDataLoader:
+    """Samples batches from multiple sub-loaders with given weights.
+
+    Each sub-loader is a ``DataLoaderImpl`` and yields ``(Observation, actions)`` batches of the
+    same shape. The mixture picks a source on every step according to ``weights`` and forwards
+    that batch. This enables mixing arbitrary data sources (RLDS, LeRobot/Groot, HF) in one run.
+    """
+
+    def __init__(self, loaders: Sequence[DataLoader], weights: Sequence[float], seed: int = 0):
+        if len(loaders) == 0:
+            raise ValueError("MixtureDataLoader requires at least one loader.")
+        if len(loaders) != len(weights):
+            raise ValueError("MixtureDataLoader requires one weight per loader.")
+        self._loaders = loaders
+        weights = np.asarray(weights, dtype=np.float64)
+        if np.any(weights <= 0):
+            raise ValueError("Mixture weights must all be positive.")
+        self._weights = weights / weights.sum()
+        self._rng = np.random.default_rng(seed)
+
+    def data_config(self) -> _config.DataConfig:
+        return self._loaders[0].data_config()
+
+    def __iter__(self) -> Iterator[tuple[_model.Observation, _model.Actions]]:
+        iters = [iter(loader) for loader in self._loaders]
+        while True:
+            index = int(self._rng.choice(len(self._loaders), p=self._weights))
+            try:
+                yield next(iters[index])
+            except StopIteration:
+                # Sub-loaders loop forever; just restart this one if it ever gets exhausted.
+                iters[index] = iter(self._loaders[index])
+                yield next(iters[index])
 
 
 class DataLoaderImpl(DataLoader):

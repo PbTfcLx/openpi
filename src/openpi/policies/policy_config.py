@@ -11,6 +11,9 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
+import openpi.shared.normalize as _normalize
+
+import openpi.training.groot_openpi_dataset as _groot_openpi_dataset
 
 
 def create_trained_policy(
@@ -57,11 +60,28 @@ def create_trained_policy(
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
+        # Prefer the normalization stats persisted with the checkpoint so inference always
+        # uses exactly what the model was trained with, independent of code/config changes.
+        # Fall back to recomputing them from the data dirs only for older checkpoints that
+        # did not persist norm stats.
         if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+            try:
+                norm_stats = _normalize.load(checkpoint_dir / "assets")
+                logging.info(f"Loaded norm stats from {str(checkpoint_dir / 'assets')}")
+            except FileNotFoundError:
+                data_dirs = data_config.data_dirs
+                if len(data_dirs) == 1:
+                    d = data_dirs[0]
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                    logging.info(f"Loaded norm stats from local data dir: {d}")
+                else:
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(
+                        data_dirs,
+                        dataset_weights=getattr(data_config, "dataset_weights", None),
+                    )
+                    logging.info(f"Loaded combined norm stats from {len(data_dirs)} data dirs")
+        else:
+            norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

@@ -1,0 +1,1 @@
+XLA_PYTHON_CLIENT_PREALLOCATE=false uv run python scripts/serve_policy.py --port=8000 policy:checkpoint --policy.config=pi05_robocasa --policy.dir=checkpoints/pi05_robocasa/robocasa_test_noise_only_opendraw/15000

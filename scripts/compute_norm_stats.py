@@ -9,6 +9,10 @@ import numpy as np
 import tqdm
 import tyro
 
+import torch
+import cProfile, pstats
+from io import StringIO
+
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
@@ -53,6 +57,7 @@ def create_torch_dataloader(
         num_workers=num_workers,
         shuffle=shuffle,
         num_batches=num_batches,
+        framework="pytorch",
     )
     return data_loader, num_batches
 
@@ -102,7 +107,7 @@ def main(config_name: str, max_frames: int | None = None):
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats", smoothing=0):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
 

@@ -69,11 +69,13 @@ class Pi0Config(_model.BaseModelConfig):
             observation_spec = _model.Observation(
                 images={
                     "base_0_rgb": image_spec,
+                    "base_1_rgb": image_spec,
                     "left_wrist_0_rgb": image_spec,
                     "right_wrist_0_rgb": image_spec,
                 },
                 image_masks={
                     "base_0_rgb": image_mask_spec,
+                    "base_1_rgb": image_mask_spec,
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },

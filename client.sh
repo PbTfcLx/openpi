@@ -1,0 +1,1 @@
+source ../Isaac-GR00T/gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/activate && export PYTHONPATH=packages/openpi-client/src/ && python examples/robocasa/main.py 

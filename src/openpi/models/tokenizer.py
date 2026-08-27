@@ -10,6 +10,7 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
+logger = logging.getLogger("openpi")
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -37,9 +38,9 @@ class PaligemmaTokenizer:
             mask = [True] * tokens_len + padding
             tokens = tokens + padding
         else:
-            if len(tokens) > self._max_len:
-                logging.warning(
-                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+            if tokens_len > self._max_len:
+                logger.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({self._max_len}), truncating. "
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
                 )
             tokens = tokens[: self._max_len]

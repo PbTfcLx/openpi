@@ -360,8 +360,12 @@ def train_loop(config: _config.TrainConfig):
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+        # Create a separate data loader for sample batch to avoid consuming the main loader.
+        # Use num_workers=0 so this one-off loader doesn't spawn (and pay the startup cost of)
+        # another full set of dataloader workers just to fetch a single batch.
+        sample_data_loader = _data.create_data_loader(
+            config, framework="pytorch", shuffle=False, num_workers=0
+        )
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
         observation, actions = sample_batch

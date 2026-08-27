@@ -29,6 +29,11 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        # Serialize policy.infer() calls. The policy keeps a JAX PRNG key that is
+        # mutated on every call, so concurrent inference is not thread-safe.
+        # Multiple connections may still be served concurrently at the I/O level;
+        # only the actual model forward pass is serialized.
+        self._infer_lock = asyncio.Lock()
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -58,7 +63,12 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                # Run inference off the event loop so that keepalive pings and
+                # other connections are not starved while the (synchronous)
+                # policy computes. The lock keeps the policy's internal RNG safe
+                # under concurrent requests.
+                async with self._infer_lock:
+                    action = await asyncio.to_thread(self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

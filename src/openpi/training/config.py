@@ -7,6 +7,7 @@ import difflib
 import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
+import os
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -28,6 +30,7 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.training.groot_openpi_dataset as _groot_openpi_dataset
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -96,6 +99,16 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+     # Used for Groot datasets
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
+
+    # Mixture of multiple data sources. Each sub-config carries its own repack / data transforms /
+    # norm stats. When set, `create_data_loader` builds one independent pipeline per sub-config
+    # and samples a batch from source ``i`` with probability ``mixture_weights[i]`` on each step.
+    # This enables jointly training on e.g. Robocasa (torch/LeRobot) and DROID (RLDS) in one run.
+    mixture_configs: tuple["DataConfig", ...] | None = None
+    mixture_weights: tuple[float, ...] | None = None
 
 
 class GroupFactory(Protocol):
@@ -354,6 +367,106 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
+
+    action_sequence_keys: Sequence[str] = ("action",)
+    repo_id: str | None = None
+
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+         # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs
+        fallback_norm_stats = None
+        base = self.create_base_config(assets_dirs, model_config)
+        if base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
+            if len(self.data_dirs) == 1:
+                d = self.data_dirs[0]
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded norm stats from local data dir: {d}")
+            else:
+                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(
+                    self.data_dirs, dataset_weights=self.dataset_weights
+                )
+                if norm_stats is not None:
+                    fallback_norm_stats = norm_stats
+                    logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            base,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            norm_stats=base.norm_stats or fallback_norm_stats,
+            data_dirs=self.data_dirs,
+            dataset_weights=self.dataset_weights,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MixtureDataConfig(DataConfigFactory):
+    """Train on an arbitrary mixture of data sources in a single run.
+
+    Each ``sources[i]`` is a ``DataConfigFactory`` (e.g. ``LeRobotRobocasaDataConfig``,
+    ``RLDSDroidDataConfig``, ``LeRobotAlohaDataConfig``, ...) with its own repack / data
+    transforms / norm stats. The data loader builds one independent pipeline per source and on
+    each step draws a batch from source ``i`` with probability ``weights[i]``.
+
+    IMPORTANT: every source must emit the same model Observation layout -- same image view keys
+    (missing views zero-padded + masked), state/actions padded to ``action_dim``, and prompts
+    tokenized to the shared ``max_token_len`` -- so that all batches have the same sequence
+    length (otherwise the jitted train step is recompiled on every source switch).
+    """
+
+    sources: tuple[DataConfigFactory, ...] = ()
+    weights: tuple[float, ...] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.sources:
+            raise ValueError("MixtureDataConfig requires at least one source.")
+        if len(self.sources) != len(self.weights):
+            raise ValueError(
+                f"MixtureDataConfig requires one weight per source "
+                f"(got {len(self.sources)} sources and {len(self.weights)} weights)."
+            )
+        if any(w <= 0 for w in self.weights):
+            raise ValueError("MixtureDataConfig weights must all be positive.")
+        sub_configs = tuple(source.create(assets_dirs, model_config) for source in self.sources)
+        # Reuse the first sub-config as the base and attach the full mixture.
+        return dataclasses.replace(
+            sub_configs[0],
+            mixture_configs=sub_configs,
+            mixture_weights=self.weights,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -555,6 +668,16 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
+
+def get_ds_meta(task):
+    meta = {}
+
+    ds_base_path = os.environ["HF_LEROBOT_HOME"]
+
+    meta["path"] = os.path.join(ds_base_path, f"single_panda_gripper.{task}")
+    meta["filter_key"] = None
+    meta["task"] = task
+    return meta
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -760,6 +883,114 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=96),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        # get_ds_meta("CloseDrawer"),
+                        # get_ds_meta("CloseDoubleDoor"),
+                        # get_ds_meta("OpenDoubleDoor"),
+                        # get_ds_meta("CoffeeSetupMug"),
+                      ],
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=22500,
+        num_workers=12,
+        save_interval=5000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_copy",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRobocasaDataConfig(
+            # repo_id is used for norm stats path only; actual data comes from repo_ids.
+            repo_id="robocasa_combined",
+            data_dirs=[
+                get_ds_meta("OpenDrawer"),
+            ],
+        ),
+        batch_size=160,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6000,
+        save_interval=30_000,
+        log_interval=100,
+        num_workers=12,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_low_mem",
+        # LoRA fine-tuning: only the LoRA adapters (plus siglip / small head projections, per the
+        # default freeze filter) are trainable, so opt/EMA/grad buffers shrink from ~25 GB to a few GB.
+        # This frees ~30-40 GB vs full finetune, allowing a much larger batch. Note: activations are
+        # unchanged (frozen layers still run full forward/backward), so per-iter time is roughly the
+        # same -- the win is memory headroom -> bigger batch -> better throughput.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=96,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        # get_ds_meta("CloseDrawer", "target"),
+                        # get_ds_meta("CloseDoubleDoor", "target"),
+                        # get_ds_meta("OpenDoubleDoor", "target"),
+                        # get_ds_meta("CoffeeSetupMug", "target"),
+                      ],
+        ),
+        # LoRA adapters start with ~zero effect, so they need a much higher LR than full finetune
+        # (peak ~1e-3 is typical for rank 16-32). Tune this to your liking.
+        batch_size=176,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-3,
+            decay_steps=12_000,
+            decay_lr=1e-4,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Turn off EMA for LoRA finetuning (keeps memory low and matches the upstream low-mem pattern).
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=3200,
+        num_workers=12,
+        save_interval=5000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=96,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
     ),
     #
     # Fine-tuning Aloha configs.
