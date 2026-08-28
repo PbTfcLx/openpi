@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -248,6 +249,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    norm_stats: dict[str, _transforms.NormStats] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -258,8 +260,23 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        norm_stats: Optional precomputed norm stats to use for the pipeline instead of the
+            ones derived from the config (e.g. loaded from the checkpoint on resume). When
+            set, it overrides the config's norm stats, and is propagated to the mixture
+            sub-configs when applicable.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    if norm_stats is not None:
+        logging.info("Overriding norm stats with externally provided values (e.g. from checkpoint).")
+        if data_config.mixture_configs is not None:
+            sub_configs = tuple(
+                dataclasses.replace(sc, norm_stats=norm_stats) for sc in data_config.mixture_configs
+            )
+            data_config = dataclasses.replace(
+                data_config, mixture_configs=sub_configs, norm_stats=norm_stats
+            )
+        else:
+            data_config = dataclasses.replace(data_config, norm_stats=norm_stats)
     logging.info(f"data_config: {data_config}")
 
     if data_config.mixture_configs is not None:

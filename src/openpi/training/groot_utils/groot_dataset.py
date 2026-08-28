@@ -18,10 +18,9 @@
 
 """
 In this file, we define 3 types of datasets:
-1. LeRobotSingleDataset: a single dataset for a given embodiment tag
-2. LeRobotMixtureDataset: a mixture of datasets for a given list of embodiment tags
-3. CachedLeRobotSingleDataset: a single dataset for a given embodiment tag,
-                                with caching for the video frames
+1. LeRobotSingleDataset: a single dataset
+2. LeRobotMixtureDataset: a mixture of datasets
+3. CachedLeRobotSingleDataset: a single dataset, with caching for the video frames
 
 See `scripts/load_dataset.py` for examples on how to use these datasets.
 """
@@ -1332,18 +1331,13 @@ class LeRobotMixtureDataset(Dataset):
                     min_max: Use the min of the 1st percentile and max of the 99th percentile.
         """
 
-        self.merged_metadata: dict[str, DatasetMetadata] = {}
-        # Group metadata by tag
-        all_metadatas: dict[str, list[DatasetMetadata]] = {}
+        # All datasets in the mixture share the same modality configs (same embodiment),
+        # so their metadata is merged into a single set of statistics. (Embodiment tags
+        # were removed; the old tag-based grouping always collapsed to one group here.)
+        merged_metadata = self.merge_metadata(
+            metadatas=[dataset.metadata for dataset in self.datasets],
+            dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
+            percentile_mixing_method=metadata_config["percentile_mixing_method"],
+        )
         for dataset in self.datasets:
-            if dataset.tag not in all_metadatas:
-                all_metadatas[dataset.tag] = []
-            all_metadatas[dataset.tag].append(dataset.metadata)
-        for tag, metadatas in all_metadatas.items():
-            self.merged_metadata[tag] = self.merge_metadata(
-                metadatas=metadatas,
-                dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
-                percentile_mixing_method=metadata_config["percentile_mixing_method"],
-            )
-        for dataset in self.datasets:
-            dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
+            dataset.set_transforms_metadata(merged_metadata)

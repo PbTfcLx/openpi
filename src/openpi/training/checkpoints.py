@@ -46,6 +46,23 @@ def _save_protected_steps(checkpoint_dir: epath.Path, steps: set[int]) -> None:
 _SAVE_CONCURRENT_GB = 24
 
 
+def latest_resumable_step(checkpoint_dir: epath.Path | str) -> int | None:
+    """Return the largest checkpoint step that contains a ``train_state`` item.
+
+    With ``save_train_state_interval``, some checkpoints are saved weight-only (no
+    ``train_state``) and cannot be resumed from. Resume should therefore target the
+    latest step that actually saved the full training state.
+    """
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    for step in sorted(ocp.utils.checkpoint_steps(checkpoint_dir), reverse=True):
+        # Orbax step dirs are named either "step_<n>" (default) or just "<n>" (as configured
+        # for this repo's CheckpointManagerOptions), so probe both.
+        for name in (f"step_{step}", str(step)):
+            if (checkpoint_dir / name / "train_state").exists():
+                return step
+    return None
+
+
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
@@ -74,9 +91,13 @@ def initialize_checkpoint_dir(
     should_keep_fn = None
     if resuming:
         existing_steps = ocp.utils.checkpoint_steps(checkpoint_dir)
-        if existing_steps:
+        # Prefer the latest checkpoint that actually saved the full training state, since
+        # weight-only checkpoints (saved when `save_train_state_interval` does not divide
+        # the step) cannot be resumed from.
+        resume_step = latest_resumable_step(checkpoint_dir)
+        if resume_step is None and existing_steps:
             resume_step = max(existing_steps)
-            if resume_step > 0:
+        if resume_step is not None and resume_step > 0:
                 # Persist the resume step so it is protected now and in future resume sessions.
                 protected_steps = _load_protected_steps(checkpoint_dir)
                 protected_steps.add(resume_step)
@@ -123,7 +144,17 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    save_train_state: bool = True,
 ):
+    """Save a checkpoint at the given step.
+
+    Args:
+        save_train_state: If True, also saves the full training state (params, optimizer,
+            EMA, step) under `train_state`, which is required to resume from this step.
+            If False, only the inference weights (`params`) and norm stats (`assets`)
+            are saved, which is much cheaper on disk but cannot be resumed from.
+    """
     def save_assets(directory: epath.Path):
         # Persist the normalization stats with the checkpoint so inference can use exactly
         # the same stats the model was trained with, independent of code/config changes.
@@ -143,9 +174,10 @@ def save_state(
         train_state, params = _split_params(state)
     items = {
         "assets": save_assets,
-        "train_state": train_state,
         "params": {"params": params},
     }
+    if save_train_state:
+        items["train_state"] = train_state
     checkpoint_manager.save(step, items)
 
 
@@ -175,6 +207,48 @@ def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _n
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats
+
+
+def load_norm_stats_from_checkpoint(
+    checkpoint_dir: epath.Path | str, asset_id: str | None
+) -> dict[str, _normalize.NormStats] | None:
+    """Load the norm stats persisted with the latest checkpoint step, if any.
+
+    During training the norm stats are saved under ``assets/`` in each checkpoint step:
+    ``assets/<asset_id>/norm_stats.json`` if ``asset_id`` is set, otherwise
+    ``assets/norm_stats.json`` (Groot-style configs). On resume we prefer these so
+    training continues with exactly the same normalization the checkpoint was trained
+    with, independent of code/config changes.
+
+    Returns ``None`` if the checkpoint does not contain persisted norm stats.
+    """
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    steps = ocp.utils.checkpoint_steps(checkpoint_dir)
+    if not steps:
+        logging.info(f"No checkpoints found in {checkpoint_dir}; skipping checkpoint norm stats.")
+        return None
+
+    step = max(steps)
+    # Orbax step dirs are named either "step_<n>" (default) or just "<n>" (as configured
+    # for this repo's CheckpointManagerOptions), so probe both.
+    assets_dir = None
+    for name in (f"step_{step}", str(step)):
+        candidate = checkpoint_dir / name / "assets"
+        if (candidate / "norm_stats.json").exists():
+            assets_dir = candidate
+            break
+    if assets_dir is None:
+        logging.info(f"No persisted norm stats in checkpoint {checkpoint_dir} (step {step}).")
+        return None
+
+    norm_stats_dir = assets_dir / asset_id if asset_id is not None else assets_dir
+    try:
+        norm_stats = _normalize.load(norm_stats_dir)
+        logging.info(f"Loaded norm stats from checkpoint: {norm_stats_dir}")
+        return norm_stats
+    except FileNotFoundError:
+        logging.info(f"Norm stats not found in checkpoint: {norm_stats_dir}")
+        return None
 
 
 class Callback(Protocol):

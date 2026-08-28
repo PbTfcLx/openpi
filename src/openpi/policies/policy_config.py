@@ -58,7 +58,16 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # For Groot-style configs (e.g. robocasa) building the data config would eagerly load norm
+    # stats from the local data dirs (`meta/stats.json`). During inference we prefer the norm
+    # stats persisted with the checkpoint (loaded below), so skip that eager read entirely to
+    # avoid unnecessary computation / crashes when the data dirs have no stats.json.
+    if isinstance(train_config.data, _config.LeRobotRobocasaDataConfig):
+        data_config = train_config.data.create(
+            train_config.assets_dirs, train_config.model, load_norm_stats=False
+        )
+    else:
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # Prefer the normalization stats persisted with the checkpoint so inference always
         # uses exactly what the model was trained with, independent of code/config changes.

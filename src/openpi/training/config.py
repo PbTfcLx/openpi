@@ -385,7 +385,13 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
 
 
     @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+    def create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+        *,
+        load_norm_stats: bool = True,
+    ) -> DataConfig:
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
         # for data coming out of the model (``outputs``) (the latter is only used during inference).
@@ -400,23 +406,31 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
-         # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs
+        # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs.
+        # Only computed when requested: inference prefers the norm stats persisted with the
+        # checkpoint and passes load_norm_stats=False to skip this eager read (which also
+        # avoids crashing when the data dirs have no `meta/stats.json`).
         fallback_norm_stats = None
         base = self.create_base_config(assets_dirs, model_config)
-        if base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
-            if len(self.data_dirs) == 1:
-                d = self.data_dirs[0]
-                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
-                if norm_stats is not None:
-                    fallback_norm_stats = norm_stats
-                    logging.info(f"Loaded norm stats from local data dir: {d}")
-            else:
-                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(
-                    self.data_dirs, dataset_weights=self.dataset_weights
+        if load_norm_stats and base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
+            try:
+                if len(self.data_dirs) == 1:
+                    d = self.data_dirs[0]
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                    if norm_stats is not None:
+                        fallback_norm_stats = norm_stats
+                        logging.info(f"Loaded norm stats from local data dir: {d}")
+                else:
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(
+                        self.data_dirs, dataset_weights=self.dataset_weights
+                    )
+                    if norm_stats is not None:
+                        fallback_norm_stats = norm_stats
+                        logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+            except FileNotFoundError as e:
+                logging.warning(
+                    f"Norm stats not found in data dirs (meta/stats.json missing); skipping fallback: {e}"
                 )
-                if norm_stats is not None:
-                    fallback_norm_stats = norm_stats
-                    logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -625,8 +639,14 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
-    # How often (in steps) to save checkpoints.
+    # How often (in steps) to save checkpoints (weights + norm stats).
     save_interval: int = 1000
+    # How often (in steps) to additionally save the full training state (optimizer, EMA,
+    # step) under `train_state`, which is required to resume training from a checkpoint.
+    # Weights + norm stats are saved every `save_interval`; the full training state is
+    # saved every `save_train_state_interval`. Defaults to `save_interval` (i.e. every
+    # checkpoint is resumable) unless overridden.
+    save_train_state_interval: int | None = None
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -667,6 +687,10 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        # The full training state (for resume) is saved every `save_train_state_interval`;
+        # default to `save_interval` so every checkpoint is resumable unless overridden.
+        if self.save_train_state_interval is None:
+            object.__setattr__(self, "save_train_state_interval", self.save_interval)
 
 
 def get_ds_meta(task):
@@ -890,26 +914,27 @@ _CONFIGS = [
         data=LeRobotRobocasaDataConfig(
             data_dirs=[
                         get_ds_meta("OpenDrawer"),
-                        # get_ds_meta("CloseDrawer"),
-                        # get_ds_meta("CloseDoubleDoor"),
-                        # get_ds_meta("OpenDoubleDoor"),
-                        # get_ds_meta("CoffeeSetupMug"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
                       ],
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=20_00,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
+            decay_steps=58000,
+            decay_lr=5e-6,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
-        num_train_steps=22500,
+        num_train_steps=60000,
         num_workers=12,
-        save_interval=5000,
+        save_interval=3000,
+        save_train_state_interval=30000,
     ),
     TrainConfig(
         name="pi05_robocasa_copy",
