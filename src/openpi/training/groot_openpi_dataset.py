@@ -126,6 +126,9 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
         # Add right camera if available
         if "video.right_view" in item:
             new_item["observation/right_image"] = item["video.right_view"][0]
+        # Tag the sample with its (single) source index so training can attribute losses per
+        # dataset. Survives collation; used for per-source loss logging.
+        new_item["source"] = np.int32(0)
         return new_item
 
 
@@ -214,6 +217,17 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
             balance_trajectory_weights=False,
             metadata_config=metadata_config,
         )
+        # Human-readable names of each source dataset. Index order matches the integer
+        # "source" tags attached to samples (used for per-source loss logging).
+        self._source_names = [
+            str(ds_meta.get("task") or pathlib.Path(ds_meta["path"]).name)
+            for ds_meta in dataset_meta_list
+        ]
+
+    @property
+    def source_names(self) -> list[str]:
+        """Names of the source datasets, aligned with the per-sample ``source`` ids."""
+        return list(self._source_names)
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """
@@ -243,7 +257,12 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
         return dataset, trajectory_id, base_index
     
     def __getitem__(self, index: SupportsIndex) -> dict:
-        item = super().__getitem__(index)
+        # Sample the (dataset, trajectory, step) ourselves so we can record which source
+        # dataset this sample came from -- the base __getitem__ discards it. Sampling
+        # semantics are identical to `LeRobotMixtureDataset.__getitem__`.
+        dataset, trajectory_id, base_index = self.sample_step(index)
+        dataset_index = int(self.datasets.index(dataset))
+        item = dataset.transforms(dataset.get_step_data(trajectory_id, base_index))
 
         state = np.concatenate([
             item["state.end_effector_position_relative"],
@@ -268,6 +287,9 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
             "prompt": item["annotation.human.action.task_description"][0], # TODO: Soroush change this later to task_description
             # "prompt": item["annotation.human.coarse_action"][0], # TODO: Soroush change this later to task_description
         }
+        # Tag the sample with its dataset index so the train loop can attribute losses per
+        # data source. Survives collation; used for per-source loss logging.
+        new_item["source"] = np.int32(dataset_index)
         # Add right camera if available
         if "video.right_view" in item:
             new_item["observation/right_image"] = item["video.right_view"][0]

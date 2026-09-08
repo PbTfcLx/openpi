@@ -56,9 +56,12 @@ def test_with_fake_dataset():
     assert len(batches) == 2
 
     for batch in batches:
-        assert all(x.shape[0] == config.batch_size for x in jax.tree.leaves(batch))
+        observation, actions, source = batch
+        assert source is None
+        assert all(x.shape[0] == config.batch_size for x in jax.tree.leaves(observation))
+        assert actions.shape[0] == config.batch_size
 
-    for _, actions in batches:
+    for _, actions, _ in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
@@ -80,5 +83,5 @@ def test_with_real_dataset():
 
     assert len(batches) == 2
 
-    for _, actions in batches:
+    for _, actions, _ in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)

@@ -82,6 +82,12 @@ class RobocasaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Pass through optional per-sample metadata (e.g. the dataset source id attached by
+        # the Groot datasets) so it survives the transform stack and lands in the collated
+        # batch, where training can use it to attribute losses per data source.
+        if "source" in data:
+            inputs["source"] = data["source"]
+
         return inputs
 
 

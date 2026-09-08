@@ -121,7 +121,7 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(save_concurrent_gb=_SAVE_CONCURRENT_GB),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            # max_to_keep=1,
             keep_period=keep_period,
             should_keep_fn=should_keep_fn,
             create=False,
@@ -202,8 +202,8 @@ def restore_state(
     return _merge_params(restored["train_state"], restored["params"])
 
 
-def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    norm_stats_dir = epath.Path(assets_dir) / asset_id
+def load_norm_stats(assets_dir: epath.Path | str, asset_id: str | None) -> dict[str, _normalize.NormStats] | None:
+    norm_stats_dir = epath.Path(assets_dir) / asset_id if asset_id is not None else epath.Path(assets_dir)
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats

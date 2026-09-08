@@ -689,4 +689,11 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            # (observation, actions, source_ids): source_ids tags each sample with its dataset
+            # index (added by the Groot datasets) or None when samples are not source-tagged.
+            # It is used to log per-source training losses.
+            yield (
+                _model.Observation.from_dict(batch),
+                batch["actions"],
+                batch.get("source", None),
+            )

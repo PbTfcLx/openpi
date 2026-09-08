@@ -43,6 +43,7 @@ import wandb
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
+import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
@@ -123,8 +124,18 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    # Use the unified data loader with PyTorch framework. On a fresh fine-tune reusing a
+    # previously-trained model's normalization, inject that checkpoint's persisted norm
+    # stats (see TrainConfig.norm_stats_checkpoint_dir) instead of recomputing them.
+    norm_stats = None
+    if config.norm_stats_dir is not None:
+        logging.info(f"Reusing norm stats from checkpoint dir: {config.norm_stats_dir}")
+        norm_stats = _checkpoints.load_norm_stats(
+            config.norm_stats_dir, None
+        )
+    data_loader = _data.create_data_loader(
+        config, framework="pytorch", shuffle=True, norm_stats=norm_stats
+    )
     return data_loader, data_loader.data_config()
 
 
@@ -368,7 +379,7 @@ def train_loop(config: _config.TrainConfig):
         )
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        observation, actions, _source = sample_batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -515,12 +526,13 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for observation, actions, _source in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
+            # The unified data loader returns (observation, actions, source) tuple; source
+            # tags samples by dataset index (Groot datasets only) and is unused here.
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
