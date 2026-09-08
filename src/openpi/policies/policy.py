@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import copy
 import logging
 import pathlib
 import time
@@ -66,12 +67,44 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Optional eval determinism keys. When present, derive the action-sampling
+        # noise deterministically from (episode_seed, replan_idx) instead of the
+        # advancing global RNG, making inference order-independent so runs are
+        # reproducible and different checkpoints can be compared on same scenes.
+        rng_seed = None
+        if "eval/episode_seed" in obs and "eval/replan_idx" in obs:
+            rng_seed = (int(obs["eval/episode_seed"]), int(obs["eval/replan_idx"]))
+
+        # Classifier-free guidance (optional): if ``cfg_scale`` is set in sample_kwargs, the
+        # observation is additionally run through the input transform with an *empty* instruction
+        # (state kept) to obtain an unconditional observation. Only supported for JAX pi0/pi05.
+        cfg_scale = self._sample_kwargs.get("cfg_scale")
+        if cfg_scale is not None:
+            if self._is_pytorch_model:
+                raise NotImplementedError("CFG inference is only supported for JAX models.")
+            if not hasattr(self._model, "pi05"):
+                raise NotImplementedError("CFG inference is only supported for pi0/pi05 models.")
+
         # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        def run_input_transform(raw: dict) -> dict:
+            inputs = jax.tree.map(lambda x: x, raw)
+            # These control keys are consumed here; strip them before transforms.
+            inputs.pop("eval/episode_seed", None)
+            inputs.pop("eval/replan_idx", None)
+            return self._input_transform(inputs)
+
+        inputs = run_input_transform(obs)
+        uncond_inputs = None
+        if cfg_scale is not None:
+            raw_uncond = copy.deepcopy(obs)
+            raw_uncond["prompt"] = ""
+            uncond_inputs = run_input_transform(raw_uncond)
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            if uncond_inputs is not None:
+                uncond_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], uncond_inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
@@ -80,14 +113,25 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        sample_kwargs.pop("cfg_scale", None)  # reserved: handled via the unconditional branch below
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        elif not self._is_pytorch_model and rng_seed is not None:
+            # Deterministic flow-matching noise: a pure function of the episode
+            # seed and replan index, independent of the shared RNG / call order.
+            noise_key = jax.random.fold_in(jax.random.key(rng_seed[0]), rng_seed[1])
+            sample_kwargs["noise"] = jax.random.normal(
+                noise_key, (1, self._model.action_horizon, self._model.action_dim)
+            )
 
         observation = _model.Observation.from_dict(inputs)
+        if uncond_inputs is not None:
+            sample_kwargs["uncond_observation"] = _model.Observation.from_dict(uncond_inputs)
+            sample_kwargs["cfg_scale"] = float(cfg_scale)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],

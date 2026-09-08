@@ -30,7 +30,7 @@ class Args:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    env_name: str = "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
+    env_name: str = "robocasa_panda_omron/CloseDoubleDoor_PandaOmron_Env"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 100  # Number of rollouts per task
     max_steps: int = 720
@@ -38,10 +38,10 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/robocasa/checkpoint-20000/videos/opendrawer"  # Path to save videos
+    video_out_path: str = "data/robocasa/test_token_len/checkpoint-21000/videos/closedoubledoor"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
-    num_envs : int = 12
+    num_envs : int = 3
 
     #################################################################################################################
     # Multi-env / video recording
@@ -49,6 +49,12 @@ class Args:
     save_video: bool = True  # Whether to save per-episode replay videos
     steps_per_render: int = 1  # Record a video frame every N env steps
     num_retries: int = 3  # Re-run an episode this many times if it hits NaN
+
+    #################################################################################################################
+    # Determinism / reproducibility
+    #################################################################################################################
+    deterministic: bool = True  # Pin action noise to (episode seed, replan index) so runs are reproducible and different checkpoints can be compared on identical scenes
+    results_out_path: str = ""  # Optional TSV to dump per-episode results (episode_idx, seed, success, length); keep the same seed/num_trials when comparing checkpoints
 
 def get_robocasa_env_fn(
     env_name: str,
@@ -125,7 +131,85 @@ def _has_nan(obs) -> bool:
             "state.base_position",
             "state.base_rotation",
             "state.gripper_qpos",
+            "state.joint_position",
         )
+    )
+
+
+# The three camera views fed to the policy and used for the replay video.
+_CAMERA_KEYS = (
+    "video.res256_image_side_0",
+    "video.res256_image_side_1",
+    "video.res256_image_wrist_0",
+)
+
+
+def _renderer_dead(obs, prev_images) -> bool:
+    """True if the offscreen renderer stopped producing real frames.
+
+    Robocasa images come straight from robosuite's MuJoCo offscreen renderer
+    (``*_image`` obs). If that renderer dies mid-episode the physics state stays
+    perfectly finite, so ``_has_nan`` never fires - the failure is purely visual
+    and has to be detected from the images themselves. The tell-tale signature
+    is that *all three* cameras (which always see different things in a live
+    scene) simultaneously start returning the same dead buffer. We flag it when
+    every camera is:
+
+      * frozen: byte-identical to the previous step's image (a live renderer
+        always moves at least a little because the arm is in motion), and/or
+      * blank:  (near-)uniform frame with essentially no contrast, and/or
+      * all three cameras (near-)identical to each other - a fallback that also
+        holds on slightly noisy frames, since different viewpoints can never
+        produce the same image in a real scene.
+
+    Returns True only when *every* camera is affected, so a legitimately dark or
+    static view (e.g. the wrist cam pressed against an object) is not flagged.
+    """
+    if prev_images is None:
+        # Nothing to compare on the very first step.
+        return False
+    imgs = [np.asarray(obs[k], dtype=np.uint8) for k in _CAMERA_KEYS]
+
+    # Byte-level gates first (each is a fast memcmp on 256x256x3).
+    # A live renderer always moves between steps because the arm is in motion,
+    # so all three cameras frozen means it stopped producing new frames...
+    frozen = [np.array_equal(imgs[i], prev_images[i]) for i in range(3)]
+    if all(frozen):
+        return True
+    # ...and two cameras that should see different viewpoints being
+    # byte-identical means they are both returning the same dead buffer.
+    pair_identical = (
+        np.array_equal(imgs[0], imgs[1]),
+        np.array_equal(imgs[0], imgs[2]),
+        np.array_equal(imgs[1], imgs[2]),
+    )
+    if all(pair_identical):
+        return True
+
+    # Otherwise every camera must independently look dead: frozen or
+    # (near-)uniform with no contrast. Std is computed on a 4x4-subsampled
+    # luma - ~free per step, and it drops high-frequency encode noise that
+    # would otherwise hide a truly flat (cleared) buffer.
+    def _is_flat(img) -> bool:
+        luma = img[::4, ::4].astype(np.float32).mean(axis=2)
+        return float(luma.std()) < 12.0
+
+    every_dead = all((frozen[i] or _is_flat(imgs[i])) for i in range(3))
+    if every_dead:
+        return True
+
+    # Fallback - different viewpoints can never be near-identical in a live
+    # scene, so if all three are, the renderer is returning one dead buffer
+    # (this still holds on slightly noisy, non-byte-identical frames).
+    return all(
+        float(
+            np.mean(
+                np.abs(imgs[i].astype(np.int16) - imgs[j].astype(np.int16))
+            )
+        )
+        < 3.0
+        for i in range(3)
+        for j in range(i + 1, 3)
     )
 
 
@@ -136,13 +220,16 @@ def _run_episode(
     seed: int | None,
     episode_idx: int,
     attempt: int = 0,
-) -> tuple[bool, int, bool]:
+) -> tuple[bool, int, bool, bool]:
     """Run one attempt of an episode.
 
-    Returns ``(success, num_env_steps, hit_nan)``. ``hit_nan`` is True when the
-    simulator entered an invalid (NaN) state, which the caller may retry.
+    Returns ``(success, num_env_steps, hit_nan, render_dead)``. ``hit_nan`` is
+    True when the simulator entered an invalid (NaN) state; ``render_dead`` is
+    True when the offscreen renderer started returning blank/frozen frames even
+    though the state stayed finite. Either may be retried by the caller.
     """
     if seed is not None:
+        _reseed_scene_rng(env, seed)
         obs, _ = env.reset(seed=seed)
     else:
         obs, _ = env.reset()
@@ -151,8 +238,11 @@ def _run_episode(
     action_plan = collections.deque()
     replay_images = []
     t = 0
+    replan_idx = 0
     done = False
     hit_nan = False
+    render_dead = False
+    prev_images = None
 
     while True:
         # Preprocess the three camera views.
@@ -177,6 +267,7 @@ def _run_episode(
                     obs["state.base_position"],
                     obs["state.base_rotation"],
                     obs["state.gripper_qpos"],
+                    obs["state.joint_position"],
                 ),
                 axis=0,
             )
@@ -187,7 +278,14 @@ def _run_episode(
                 "observation/state": state,
                 "prompt": task_description,
             }
+            if args.deterministic and seed is not None:
+                # Pin sampling noise to (episode seed, replan index) so the
+                # policy's stochasticity is reproducible and identical across
+                # checkpoints evaluated on the same scene.
+                element["eval/episode_seed"] = int(seed)
+                element["eval/replan_idx"] = int(replan_idx)
             action_chunk = client.infer(element)["actions"]
+            replan_idx += 1
             assert len(action_chunk) >= args.replan_steps, (
                 f"We want to replan every {args.replan_steps} steps, but policy "
                 f"only predicts {len(action_chunk)} steps."
@@ -211,6 +309,14 @@ def _run_episode(
             hit_nan = True
             break
 
+        # The reverse also happens: the renderer dies while the state stays
+        # finite (NaN checks see nothing). All cameras then return the same
+        # frozen/blank buffer, which would silently poison both the policy input
+        # and the replay video for the rest of the episode - abort and retry.
+        if not success and _renderer_dead(obs, prev_images):
+            render_dead = True
+            break
+
         if args.save_video and (
             t % args.steps_per_render == 0 or success or terminated or truncated
         ):
@@ -221,7 +327,11 @@ def _run_episode(
             break
         t += 1
 
-    if args.save_video and replay_images and not hit_nan:
+        # Remember this step's camera images so the next step can detect a
+        # renderer freeze (images identical across consecutive env steps).
+        prev_images = tuple(np.asarray(obs[k]) for k in _CAMERA_KEYS)
+
+    if args.save_video and replay_images and not (hit_nan or render_dead):
         suffix = "success" if done else "failure"
         video_path = (
             pathlib.Path(args.video_out_path)
@@ -232,7 +342,7 @@ def _run_episode(
         except Exception as e:  # noqa: BLE001 - video is best-effort
             logging.error(f"Failed to save video {video_path}: {e}")
 
-    return done, t + 1, hit_nan
+    return done, t + 1, hit_nan, render_dead
 
 
 def _run_worker(
@@ -263,24 +373,36 @@ def _run_worker(
             success, length = False, 0
             for attempt in range(args.num_retries):
                 try:
-                    success, length, hit_nan = _run_episode(
+                    success, length, hit_nan, render_dead = _run_episode(
                         env, client, args, seed, episode_idx, attempt
                     )
                 except Exception as e:  # noqa: BLE001 - report per-episode failures
                     logging.error(f"Worker {worker_id} failed on episode {episode_idx}: {e}")
                     result_queue.put((episode_idx, None, str(e)))
                     return
-                if not hit_nan:
+                if not (hit_nan or render_dead):
                     break
                 if attempt < args.num_retries:
+                    if render_dead:
+                        # A dead renderer usually means this worker's offscreen
+                        # EGL/GL context is corrupted. Reusing the same env will
+                        # most likely stay broken, so build a fresh one (and with
+                        # it a fresh render context).
+                        try:
+                            env.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        env = _make_env(args.env_name, args.max_steps)
+                    reason = "NaN state" if hit_nan else "dead renderer"
                     logging.warning(
                         f"Episode {episode_idx} attempt {attempt + 1}/{args.num_retries} "
-                        f"hit NaN, retrying..."
+                        f"hit {reason}, retrying..."
                     )
             else:
-                # Retry budget exhausted and still NaN.
+                reason = "NaN state" if hit_nan else "dead renderer"
+                # Retry budget exhausted and the episode never recovered.
                 logging.error(
-                    f"[ALARM] Episode {episode_idx}: NaN persisted after "
+                    f"[ALARM] Episode {episode_idx}: {reason} persisted after "
                     f"{args.num_retries} retries, marking as failure"
                 )
             result_queue.put((episode_idx, bool(success), length))
@@ -303,11 +425,32 @@ def _make_env(env_name: str, max_steps: int) -> gym.Env:
     return env
 
 
+def _reseed_scene_rng(env: gym.Env, seed: int) -> None:
+    """Make the next ``env.reset()`` scene a pure function of ``seed``.
+
+    Robocasa samples the kitchen layout/style/object placement/initial pose from
+    the robosuite environment's internal ``rng`` (an ``np.random.default_rng``
+    created with ``seed=None`` at env construction). ``RoboCasaEnv.reset`` only
+    reseeds the *global* numpy RNG, which robocasa ignores - so without this, two
+    runs (or two checkpoints) given the same episode seed still get *different*
+    scenes. Reseeding the inner RNG pins the scene to ``seed``.
+    """
+    # env.unwrapped -> RoboCasaEnv (gym.Env); its .env is the robosuite env.
+    env.unwrapped.env.rng = np.random.default_rng(seed)
+
+
 def eval_robocasa(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+
+    results_file = None
+    if args.results_out_path:
+        pathlib.Path(args.results_out_path).parent.mkdir(parents=True, exist_ok=True)
+        results_file = open(args.results_out_path, "a")
+        if results_file.tell() == 0:
+            results_file.write("episode_idx\tseed\tsuccess\tlength\n")
 
     n_envs = max(int(args.num_envs), 1)
     total_episodes = int(args.num_trials_per_task)
@@ -350,11 +493,14 @@ def eval_robocasa(args: Args) -> None:
 
             successes.append(bool(success))
             pbar.update(1)
-            # logging.info(
-            #     f"Episode {episode_idx}: success={bool(success)}, length={length}"
-            # )
+            if results_file is not None:
+                seed = args.seed + episode_idx if args.seed is not None else -1
+                results_file.write(f"{episode_idx}\t{seed}\t{int(bool(success))}\t{length}\n")
+                results_file.flush()
     finally:
         pbar.close()
+        if results_file is not None:
+            results_file.close()
         for worker in workers:
             worker.terminate()
         for worker in workers:
