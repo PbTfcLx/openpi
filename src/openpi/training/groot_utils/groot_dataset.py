@@ -609,6 +609,10 @@ class LeRobotSingleDataset(Dataset):
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
         else:
+            # Cache the loaded trajectory so repeated samples from the same episode reuse
+            # it instead of re-reading (and re-allocating) the whole parquet every step.
+            # Without this, pyarrow's memory pool churns on every step and the RSS grows.
+            self.curr_traj_id = trajectory_id
             chunk_index = self.get_episode_chunk(trajectory_id)
             parquet_path = self.dataset_path / self.data_path_pattern.format(
                 episode_chunk=chunk_index, episode_index=trajectory_id

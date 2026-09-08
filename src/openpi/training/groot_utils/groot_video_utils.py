@@ -19,6 +19,7 @@ import torchvision  # noqa: F401 # isort: skip
 import av
 import cv2
 import importlib
+import os
 if importlib.util.find_spec("torchcodec"):
     from torchcodec.decoders import VideoDecoder
 else:
@@ -26,8 +27,6 @@ else:
 
 # import decord  # noqa: F401
 import numpy as np
-
-_vr_dict = {}
 
 def get_frames_by_timestamps(
     video_path: str,
@@ -44,11 +43,7 @@ def get_frames_by_timestamps(
         np.ndarray: Frames at the specified timestamps.
     """
     if video_backend == "decord":
-        if _vr_dict.get(video_path, None):
-            vr = _vr_dict[video_path]
-        else:
-            vr = decord.VideoReader(video_path, **video_backend_kwargs)
-            _vr_dict[video_path] = vr
+        vr = decord.VideoReader(video_path, **video_backend_kwargs)
         num_frames = len(vr)
         # Retrieve the timestamps for each frame in the video
         frame_ts: np.ndarray = vr.get_frame_timestamp(range(num_frames))
@@ -60,37 +55,42 @@ def get_frames_by_timestamps(
     elif video_backend == "opencv":
         # Open the video file
         cap = cv2.VideoCapture(video_path, **video_backend_kwargs)
-        if not cap.isOpened():
-            raise ValueError(f"Unable to open video file: {video_path}")
-        # Retrieve the total number of frames
-        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Calculate timestamps for each frame
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_ts = np.arange(num_frames) / fps
-        frame_ts = frame_ts[
-            :, np.newaxis
-        ]  # Reshape to (num_frames, 1) for broadcasting
-        # Map each requested timestamp to the closest frame index
-        indices = np.abs(frame_ts - timestamps).argmin(axis=0)
-        frames = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError(f"Unable to read frame at index {idx}")
-            frames.append(frame)
-        frames = np.array(frames)
-        frames = np.flip(frames, axis=-1)
-        return frames
+        try:
+            if not cap.isOpened():
+                raise ValueError(f"Unable to open video file: {video_path}")
+            # Retrieve the total number of frames
+            num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Calculate timestamps for each frame
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_ts = np.arange(num_frames) / fps
+            frame_ts = frame_ts[
+                :, np.newaxis
+            ]  # Reshape to (num_frames, 1) for broadcasting
+            # Map each requested timestamp to the closest frame index
+            indices = np.abs(frame_ts - timestamps).argmin(axis=0)
+            frames = []
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if not ret:
+                    raise ValueError(f"Unable to read frame at index {idx}")
+                frames.append(frame)
+            frames = np.array(frames)
+            frames = np.flip(frames, axis=-1)
+            return frames
+        finally:
+            # cv2.VideoCapture keeps the underlying decoder (and its buffers) alive until
+            # release() is called. Leaking it here is a real host-RAM leak in training:
+            # it's opened once per video view per sample in every DataLoader worker.
+            cap.release()
+            fd = os.open(video_path, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
     elif video_backend == "torchvision_av":
         # set backend
         torchvision.set_video_backend("pyav")
         # set a video stream reader
-        if _vr_dict.get(video_path, None):
-            reader = _vr_dict[video_path]
-        else:
-            reader = torchvision.io.VideoReader(video_path, "video")
-            _vr_dict[video_path] = reader
+        reader = torchvision.io.VideoReader(video_path, "video")
         # set the first and last requested timestamps
         # Note: previous timestamps are usually loaded, since we need to access the previous key frame
         first_ts = timestamps[0]
@@ -114,11 +114,7 @@ def get_frames_by_timestamps(
         return frames.transpose(0, 2, 3, 1)
     elif video_backend == "torchcodec":
         # initialize video decoder
-        if _vr_dict.get(video_path, None):
-            decoder = _vr_dict[video_path]
-        else:
-            decoder = VideoDecoder(video_path, device="cpu", seek_mode="approximate")
-            _vr_dict[video_path] = decoder
+        decoder = VideoDecoder(video_path, device="cpu", seek_mode="approximate")
         loaded_frames = []
         loaded_ts = []
         # get metadata for frame information
@@ -155,18 +151,10 @@ def get_all_frames(
         resize_size (tuple[int, int], optional): Resize size for the frames. Defaults to None.
     """
     if video_backend == "decord":
-        if _vr_dict.get(video_path, None):
-            vr = _vr_dict[video_path]
-        else:
-            vr = decord.VideoReader(video_path, **video_backend_kwargs)
-            _vr_dict[video_path] = vr
+        vr = decord.VideoReader(video_path, **video_backend_kwargs)
         frames = vr.get_batch(range(len(vr))).asnumpy()
     elif video_backend == "pyav":
-        if _vr_dict.get(video_path, None):
-            container = _vr_dict[video_path]
-        else:
-            container = av.open(video_path)
-            _vr_dict[video_path] = container
+        container = av.open(video_path)
         frames = []
         for frame in container.decode(video=0):
             frame = frame.to_ndarray(format="rgb24")
@@ -175,22 +163,14 @@ def get_all_frames(
     elif video_backend == "torchvision_av":
         # set backend and reader
         torchvision.set_video_backend("pyav")
-        if _vr_dict.get(video_path, None):
-            reader = _vr_dict[video_path]
-        else:
-            reader = torchvision.io.VideoReader(video_path, "video")
-            _vr_dict[video_path] = reader
+        reader = torchvision.io.VideoReader(video_path, "video")
         frames = []
         for frame in reader:
             frames.append(frame["data"].numpy())
         frames = np.array(frames)
         frames = frames.transpose(0, 2, 3, 1)
     elif video_backend == "torchcodec":
-        if _vr_dict.get(video_path, None):
-            decoder = _vr_dict[video_path]
-        else:
-            decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
-            _vr_dict[video_path] = decoder
+        decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
         frames = decoder[::1]
         frames = np.array(frames)
         frames.transpose(0, 2, 3, 1)

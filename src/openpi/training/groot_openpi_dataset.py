@@ -75,7 +75,7 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
                 modality_keys=video_modality_keys,  # we will include all video modalities
             ),
             "state": ModalityConfig(
-                delta_indices=delta_indices_obs,
+                delta_indices=delta_indices,
                 modality_keys=state_modality_keys,
             ),
             "action": ModalityConfig(
@@ -106,6 +106,7 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
             item["state.base_position"],
             item["state.base_rotation"],
             item["state.gripper_qpos"],
+            item["state.joint_position"],
         ], axis=1)
         actions = np.concatenate([
             item["action.end_effector_position"],
@@ -113,6 +114,8 @@ class GrootOpenpiSingleDataset(LeRobotSingleDataset):
             item["action.gripper_close"],
             item["action.base_motion"],
             item["action.control_mode"],
+            item["state.joint_velocity"],
+            item["state.gripper_qvel"],
         ], axis=1)
 
         new_item = {
@@ -162,7 +165,7 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
                     modality_keys=video_modality_keys,  # we will include all video modalities
                 ),
                 "state": ModalityConfig(
-                    delta_indices=delta_indices_obs,
+                    delta_indices=delta_indices,
                     modality_keys=state_modality_keys,
                 ),
                 "action": ModalityConfig(
@@ -214,7 +217,7 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
             data_mixture=dataset_mixture,
             mode="train", 
             balance_dataset_weights=False,
-            balance_trajectory_weights=False,
+            balance_trajectory_weights=True,
             metadata_config=metadata_config,
         )
         # Human-readable names of each source dataset. Index order matches the integer
@@ -270,6 +273,7 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
             item["state.base_position"],
             item["state.base_rotation"],
             item["state.gripper_qpos"],
+            item["state.joint_position"],
         ], axis=1)
         actions = np.concatenate([
             item["action.end_effector_position"],
@@ -277,6 +281,8 @@ class GrootOpenpiMultiDataset(LeRobotMixtureDataset):
             item["action.gripper_close"],
             item["action.base_motion"],
             item["action.control_mode"],
+            item["state.joint_velocity"],
+            item["state.gripper_qvel"],
         ], axis=1)
 
         new_item = {
@@ -362,16 +368,18 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     the groot state ordering
     "state.base_position" 0, 1, 2
     "state.base_rotation" 3, 4, 5, 6
-    "state.end_effector_position_relative" 7, 8, 9
-    "state.end_effector_rotation_relative" 10, 11, 12, 13
-    "state.gripper_qpos" 14, 15
+    "state.end_effector_position_relative" 10, 11, 12
+    "state.end_effector_rotation_relative" 17, 18, 19, 20
+    "state.gripper_qpos" 21, 22
+    "state.joint_position" 25, 26, 27, 28, 29, 30, 31
 
     the desired state ordering
-    "state.end_effector_position_relative" 7, 8, 9
-    "state.end_effector_rotation_relative" 10, 11, 12, 13
+    "state.end_effector_position_relative" 10, 11, 12
+    "state.end_effector_rotation_relative" 17, 18, 19, 20
     "state.base_position" 0, 1, 2
     "state.base_rotation" 3, 4, 5, 6
-    "state.gripper_qpos" 14, 15
+    "state.gripper_qpos" 21, 22
+    "state.joint_position" 25, 26, 27, 28, 29, 30, 31
     """
     raw_states_stats = data["observation.state"]
     raw_states_mean = np.array(raw_states_stats["mean"])
@@ -380,7 +388,7 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     raw_states_q99 = np.array(raw_states_stats["q99"])
 
     # HACK: choose appropriate state indices
-    states_indices = [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6, 14, 15]
+    states_indices = [10, 11, 12, 17, 18, 19, 20, 0, 1, 2, 3, 4, 5, 6, 21, 22, 25, 26, 27, 28, 29, 30, 31]
     states_mean = raw_states_mean[states_indices]
     states_std = raw_states_std[states_indices]
     states_q01 = raw_states_q01[states_indices]
@@ -400,6 +408,8 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     "action.end_effector_position" 5, 6, 7
     "action.end_effector_rotation" 8, 9, 10
     "action.gripper_close" 11
+    "state.joint_velocity" 46:53
+    "state.gripper_qvel" 23:25
 
     the desired action ordering
     "action.end_effector_position" 5, 6, 7
@@ -407,6 +417,8 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     "action.gripper_close" 11
     "action.base_motion" 0, 1, 2, 3
     "action.control_mode" 4
+    "state.joint_velocity" 46:53
+    "state.gripper_qvel" 23:25
     """
     raw_actions_stats = data["action"]
     raw_actions_mean = np.array(raw_actions_stats["mean"])
@@ -416,10 +428,14 @@ def _load_norm_stats_from_groot_dataset(ds_meta: dict) -> dict[str, _transforms.
     
     # HACK: choose appropriate action indices
     actions_indices = [5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4]
-    actions_mean = raw_actions_mean[actions_indices]
-    actions_std = raw_actions_std[actions_indices]
-    actions_q01 = raw_actions_q01[actions_indices]
-    actions_q99 = raw_actions_q99[actions_indices]
+    actions_mean = np.concatenate([raw_actions_mean[actions_indices], raw_states_mean[46:53], raw_states_mean[23:25]], axis=-1)
+    actions_std = np.concatenate([raw_actions_std[actions_indices], raw_states_std[46:53], raw_states_std[23:25]], axis=-1)
+    actions_q01 = np.concatenate([raw_actions_q01[actions_indices], raw_states_q01[46:53], raw_states_q01[23:25]], axis=-1)
+    actions_q99 = np.concatenate([raw_actions_q99[actions_indices], raw_states_q99[46:53], raw_states_q99[23:25]], axis=-1)
+    # actions_mean = raw_actions_mean[actions_indices]
+    # actions_std = raw_actions_std[actions_indices]
+    # actions_q01 = raw_actions_q01[actions_indices]
+    # actions_q99 = raw_actions_q99[actions_indices]
 
     actions_stats = _normalize.NormStats(
         mean=pad_zeros(actions_mean, targ_len=32),
