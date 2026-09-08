@@ -221,8 +221,12 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        uncond_observation: _model.Observation | None = None,
+        cfg_scale: float = 1.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        if uncond_observation is not None:
+            uncond_observation = _model.preprocess_observation(None, uncond_observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -230,14 +234,31 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
+        # Classifier-free guidance: when `uncond_observation` is provided (an observation whose
+        # language instruction has been blanked, e.g. prompt=""), each denoising step evaluates
+        # the velocity under both the conditional and the unconditional prefix and extrapolates:
+        #   v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        # The suffix (noisy actions + timestep) is identical for both branches; only the prefix KV
+        # cache differs. cfg_scale == 1.0 reduces to the plain conditional sample.
+        use_cfg = uncond_observation is not None
+
+        # first fill KV cache with a forward pass of the prefix (conditional)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        if use_cfg:
+            # ... and of the unconditional prefix (empty instruction, state kept)
+            u_prefix_tokens, u_prefix_mask, u_prefix_ar_mask = self.embed_prefix(uncond_observation)
+            u_prefix_attn_mask = make_attn_mask(u_prefix_mask, u_prefix_ar_mask)
+            u_positions = jnp.cumsum(u_prefix_mask, axis=1) - 1
+            _, u_kv_cache = self.PaliGemma.llm(
+                [u_prefix_tokens, None], mask=u_prefix_attn_mask, positions=u_positions
+            )
+
+        def velocity(x_t, time, prefix_mask, kv_cache):
+            """Read out the predicted velocity for the current suffix under the given prefix KV cache."""
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -266,8 +287,15 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        def step(carry):
+            x_t, time = carry
+            broadcast_time = jnp.broadcast_to(time, batch_size)
+            v_t = velocity(x_t, broadcast_time, prefix_mask, kv_cache)
+            if use_cfg:
+                v_uncond = velocity(x_t, broadcast_time, u_prefix_mask, u_kv_cache)
+                v_t = v_uncond + cfg_scale * (v_t - v_uncond)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
