@@ -49,7 +49,7 @@ class Einsum(nn.Module):
             shape_a[config.axes[1]] = config.rank
             shape_b[config.axes[0]] = config.rank
             self.w_a = self.param("lora_a", config.init_fn, shape_a)
-            self.w_b = self.param("lora_b", config.init_fn, shape_b)
+            self.w_b = self.param("lora_b", nn.initializers.zeros, shape_b)
 
     @nn.compact
     def __call__(self, eqn: str, x):
@@ -112,12 +112,12 @@ class FeedForward(nn.Module):
             self.w_gating_lora = (
                 self.param("gating_einsum_lora_a", self.lora_config.init_fn, (2, self.features, self.lora_config.rank)),
                 self.param(
-                    "gating_einsum_lora_b", self.lora_config.init_fn, (2, self.lora_config.rank, self.hidden_dim)
+                    "gating_einsum_lora_b", nn.initializers.zeros, (2, self.lora_config.rank, self.hidden_dim)
                 ),
             )
             self.w_linear_lora = (
                 self.param("linear_lora_a", self.lora_config.init_fn, (self.hidden_dim, self.lora_config.rank)),
-                self.param("linear_lora_b", self.lora_config.init_fn, (self.lora_config.rank, self.features)),
+                self.param("linear_lora_b", nn.initializers.zeros, (self.lora_config.rank, self.features)),
             )
 
     @nn.compact
