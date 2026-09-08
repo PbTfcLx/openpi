@@ -93,6 +93,23 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Training-only prompt dropout probability. With this probability the prompt is
+    # replaced with an empty string right before tokenization, so the model learns to
+    # act without a reliable instruction (robustness / CFG-friendly). Injected by the
+    # data loader only -- inference never applies it.
+    prompt_drop_p: float = 0.0
+
+    # Training-only GR00T-style state corruption. When ``state_noise`` is True, each
+    # sample's normalized state is mixed toward a unit Gaussian with a per-sample
+    # strength u ~ Beta(state_noise_beta_a, state_noise_beta_b):
+    #   state' = (1 - u) * state + u * N(0, 1)
+    # GR00T defaults (1.5, 1.0) corrupt heavily (mode near u=1); for the discretized
+    # text state you usually want milder, e.g. (1.0, 2.0). Applied after normalization
+    # and before TokenizePrompt, training only.
+    state_noise: bool = False
+    state_noise_beta_a: float = 1.0
+    state_noise_beta_b: float = 2.0
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -383,6 +400,12 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
     action_sequence_keys: Sequence[str] = ("action",)
     repo_id: str | None = None
 
+    # Training-only prompt dropout probability (see DataConfig.prompt_drop_p).
+    prompt_drop_p: float = 0.0
+    # Training-only GR00T-style state corruption (see DataConfig.state_noise*).
+    state_noise: bool = False
+    state_noise_beta_a: float = 1.0
+    state_noise_beta_b: float = 2.0
 
     @override
     def create(
@@ -441,6 +464,10 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
             norm_stats=base.norm_stats or fallback_norm_stats,
             data_dirs=self.data_dirs,
             dataset_weights=self.dataset_weights,
+            prompt_drop_p=self.prompt_drop_p,
+            state_noise=self.state_noise,
+            state_noise_beta_a=self.state_noise_beta_a,
+            state_noise_beta_b=self.state_noise_beta_b,
         )
 
 
@@ -608,6 +635,14 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+
+    # Optional directory of a previously-trained checkpoint (an exp dir, e.g.
+    # `./checkpoints/pi05_robocasa/fix_checkpoint`) whose persisted norm stats
+    # (`<latest_step>/assets/norm_stats.json`) should be reused for this run.
+    # Intended for fine-tuning an already-trained model on *new* data under a *new*
+    # exp_name: instead of recomputing/loading norm stats from the (new) data, the
+    # pipeline keeps exactly the normalization the model was trained with.
+    norm_stats_dir: str | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -910,7 +945,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_robocasa",
-        model=pi0_config.Pi0Config(pi05=True, max_token_len=96),
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=112),
         data=LeRobotRobocasaDataConfig(
             data_dirs=[
                         get_ds_meta("OpenDrawer"),
@@ -934,41 +969,56 @@ _CONFIGS = [
         num_train_steps=60000,
         num_workers=12,
         save_interval=3000,
-        save_train_state_interval=30000,
+        save_train_state_interval=60000,
     ),
     TrainConfig(
-        name="pi05_robocasa_copy",
+        name="pi05_robocasa_finetune_new_data",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=20,
-            discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            max_token_len=112,
         ),
         data=LeRobotRobocasaDataConfig(
             # repo_id is used for norm stats path only; actual data comes from repo_ids.
             repo_id="robocasa_combined",
             data_dirs=[
+                get_ds_meta("TurnOnStove"),
                 get_ds_meta("OpenDrawer"),
+                get_ds_meta("CloseDrawer"),
+                get_ds_meta("CloseDoubleDoor"),
+                get_ds_meta("OpenDoubleDoor"),
+                get_ds_meta("CoffeeSetupMug"),
+                # get_ds_meta("TurnSinkSpout"),
+            ],
+            dataset_weights=[21.0,
+                             2.0,
+                             1.0,
+                             2.0,
+                             3.0,
+                             3.0,
             ],
         ),
-        batch_size=160,
+        batch_size=176,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
+            warmup_steps=100,
             peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=2.5e-6,
+            decay_steps=4800,
+            decay_lr=5e-6,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            max_token_len=112,
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=6000,
-        save_interval=30_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_robocasa/test_token_len/24000/params"),
+        norm_stats_dir="checkpoints/pi05_robocasa/test_token_len/24000/assets",
+        num_train_steps=5000,
+        save_interval=1000,
+        save_train_state_interval=30000,
         log_interval=100,
         num_workers=12,
     ),

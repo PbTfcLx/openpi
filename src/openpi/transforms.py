@@ -112,6 +112,60 @@ class InjectDefaultPrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class RandomPromptDrop(DataTransformFn):
+    """Randomly replace the prompt with an empty string (prompt/conditioning dropout).
+
+    Training-only regularization: with probability ``p`` the language instruction is
+    blanked right before ``TokenizePrompt`` runs, teaching the model to act without
+    (or with an unreliable) instruction. Keeps the ``"prompt"`` key (set to ``""``)
+    rather than deleting it so ``InjectDefaultPrompt`` will not re-inject a default.
+
+    NOTE (pi05): since the state is concatenated into the language prefix, a dropped
+    prompt still tokenizes to something like ``"Task: , State: ..."``.
+    """
+
+    p: float = 0.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.p > 0.0 and "prompt" in data and np.random.random() < self.p:
+            data["prompt"] = np.asarray("")
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class InterpolatedStateNoise(DataTransformFn):
+    """GR00T-style train-only state corruption (schedule-interpolated).
+
+    For each sample a corruption strength ``u ~ Beta(beta_a, beta_b)`` is drawn and the
+    normalized state is mixed toward a unit Gaussian::
+
+        state' = (1 - u) * state + u * noise,    noise ~ N(0, 1)
+
+    ``u = 0`` keeps the clean state; ``u = 1`` replaces it with pure noise (which, once
+    discretized to 256 bins, saturates to a garbage text state). This mirrors the state
+    corruption in GR00T-N1's action head (``state * t + (1 - t) * noise`` with ``t``
+    sampled via a Beta) -- GR00T defaults are ``beta_a=1.5, beta_b=1.0`` (mostly heavy
+    corruption). It is applied to the *continuous* state right before pi05 discretizes it
+    into text, WITHOUT a shared diffusion timestep / time conditioning (approximation).
+
+    Runs AFTER ``Normalize`` and BEFORE ``TokenizePrompt``; training-only (data loader).
+    """
+
+    beta_a: float = 1.0
+    beta_b: float = 2.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (state := data.get("state")) is None:
+            return data
+        u = float(np.random.beta(self.beta_a, self.beta_b))
+        if u <= 0.0:
+            return data
+        noise = np.random.normal(0.0, 1.0, size=state.shape).astype(state.dtype)
+        data["state"] = state * (1.0 - u) + noise * u
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.

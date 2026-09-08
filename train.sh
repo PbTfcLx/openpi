@@ -1,0 +1,1 @@
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_robocasa_finetune_new_data --exp-name test_finetune_all_data --overwrite

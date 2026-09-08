@@ -4,7 +4,7 @@ import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import Any, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -201,12 +201,29 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
+    prompt_drop = (
+        [_transforms.RandomPromptDrop(p=data_config.prompt_drop_p)]
+        if data_config.prompt_drop_p > 0.0
+        else []
+    )
+    state_noise = (
+        [
+            _transforms.InterpolatedStateNoise(
+                beta_a=data_config.state_noise_beta_a,
+                beta_b=data_config.state_noise_beta_b,
+            )
+        ]
+        if data_config.state_noise
+        else []
+    )
     return TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *prompt_drop,
+            *state_noise,
             *data_config.model_transforms.inputs,
         ],
     )
@@ -229,12 +246,29 @@ def transform_iterable_dataset(
             )
         norm_stats = data_config.norm_stats
 
+    prompt_drop = (
+        [_transforms.RandomPromptDrop(p=data_config.prompt_drop_p)]
+        if data_config.prompt_drop_p > 0.0
+        else []
+    )
+    state_noise = (
+        [
+            _transforms.InterpolatedStateNoise(
+                beta_a=data_config.state_noise_beta_a,
+                beta_b=data_config.state_noise_beta_b,
+            )
+        ]
+        if data_config.state_noise
+        else []
+    )
     return IterableTransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *prompt_drop,
+            *state_noise,
             *data_config.model_transforms.inputs,
         ],
         is_batched=is_batched,
@@ -667,7 +701,7 @@ class MixtureDataLoader:
     def data_config(self) -> _config.DataConfig:
         return self._loaders[0].data_config()
 
-    def __iter__(self) -> Iterator[tuple[_model.Observation, _model.Actions]]:
+    def __iter__(self) -> Iterator[tuple[_model.Observation, _model.Actions, Any]]:
         iters = [iter(loader) for loader in self._loaders]
         while True:
             index = int(self._rng.choice(len(self._loaders), p=self._weights))
