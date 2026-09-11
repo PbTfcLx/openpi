@@ -5,6 +5,7 @@ import multiprocessing
 import pathlib
 import queue
 
+import cv2
 import imageio
 import robocasa  # noqa: F401
 import robocasa.utils.gym_utils.gymnasium_groot  # noqa: F401
@@ -102,12 +103,83 @@ def _to_bool(value) -> bool:
     return bool(value)
 
 
-def _make_replay_frame(obs) -> np.ndarray:
+# Styling for the prompt banner drawn under each replay frame.
+_BANNER_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_BANNER_SCALE = 0.5
+_BANNER_THICKNESS = 1
+_BANNER_PAD = 6
+_BANNER_BG = (0, 0, 0)  # black
+_BANNER_FG = (255, 255, 255)  # white
+
+
+def _wrap_banner_text(text: str, max_width: int) -> list[str]:
+    """Greedily wrap ``text`` into lines that fit within ``max_width`` pixels."""
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}".strip()
+        width = cv2.getTextSize(
+            candidate, _BANNER_FONT, _BANNER_SCALE, _BANNER_THICKNESS
+        )[0][0]
+        # Always keep at least one word per line, even if it overflows.
+        if width <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_prompt_banner(frame: np.ndarray, prompt: str) -> np.ndarray:
+    """Append a black banner showing the task prompt at the bottom of ``frame``.
+
+    The text is wrapped to the frame width and the banner grows by as many lines
+    as needed, so long task descriptions stay fully readable.
+    """
+    if not prompt:
+        return frame
+
+    frame = np.ascontiguousarray(frame, dtype=np.uint8)
+    max_width = max(frame.shape[1] - 2 * _BANNER_PAD, 1)
+    lines = _wrap_banner_text(str(prompt), max_width)
+
+    (_, text_h), baseline = cv2.getTextSize(
+        "Ag", _BANNER_FONT, _BANNER_SCALE, _BANNER_THICKNESS
+    )
+    line_step = text_h + baseline + 4
+    # The cameras are 256px tall (a multiple of 16), so keeping the banner a
+    # multiple of 16 as well keeps the video height encoder-friendly - otherwise
+    # ffmpeg rescales every frame (macro_block_size warning) on write.
+    banner_h = -(-(2 * _BANNER_PAD + line_step * len(lines)) // 16) * 16
+    banner = np.full((banner_h, frame.shape[1], 3), _BANNER_BG, dtype=np.uint8)
+
+    text_block_h = line_step * (len(lines) - 1) + text_h
+    y = (banner_h - text_block_h) // 2 + text_h
+    for line in lines:
+        cv2.putText(
+            banner,
+            line,
+            (_BANNER_PAD, y),
+            _BANNER_FONT,
+            _BANNER_SCALE,
+            _BANNER_FG,
+            _BANNER_THICKNESS,
+            cv2.LINE_AA,
+        )
+        y += line_step
+
+    return np.concatenate((frame, banner), axis=0)
+
+
+def _make_replay_frame(obs, prompt: str = "") -> np.ndarray:
     """Tile the three camera views into one wide frame for the replay video.
 
-    The order matches the policy input: side_0, side_1, wrist.
+    The order matches the policy input: side_0, side_1, wrist. ``prompt`` (the
+    task description) is drawn on a banner below the tiled cameras.
     """
-    return np.concatenate(
+    frame = np.concatenate(
         (
             np.ascontiguousarray(obs["video.res256_image_side_0"]),
             np.ascontiguousarray(obs["video.res256_image_side_1"]),
@@ -115,6 +187,7 @@ def _make_replay_frame(obs) -> np.ndarray:
         ),
         axis=1,
     )
+    return _draw_prompt_banner(frame, prompt)
 
 
 def _has_nan(obs) -> bool:
@@ -320,7 +393,7 @@ def _run_episode(
         if args.save_video and (
             t % args.steps_per_render == 0 or success or terminated or truncated
         ):
-            replay_images.append(_make_replay_frame(obs))
+            replay_images.append(_make_replay_frame(obs, task_description))
 
         if success or terminated or truncated:
             done = success
