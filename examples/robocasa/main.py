@@ -25,6 +25,10 @@ class Args:
     #################################################################################################################
     host: str = "0.0.0.0"
     port: int = 8000
+    # API key of the policy server, if it was started with one (see deploy/autodl/).
+    # For a remote server reachable over the public internet, pass e.g.
+    # `--host wss://uXXXX-xxx.bjb1.seetacloud.com --port 8443`.
+    api_key: str | None = None
     resize_size: int = 224
     replan_steps: int = 5
 
@@ -433,7 +437,7 @@ def _run_worker(
     """
     env = None
     try:
-        client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+        client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port, api_key=args.api_key)
         env = _make_env(args.env_name, args.max_steps)
 
         while True:

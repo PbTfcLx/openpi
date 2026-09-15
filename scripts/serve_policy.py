@@ -1,6 +1,7 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
 
 import tyro
@@ -50,6 +51,11 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+
+    # Shared secret required from clients (sent as `Authorization: Api-Key <key>`).
+    # Falls back to the OPENPI_API_KEY environment variable when not provided.
+    # Strongly recommended when the server is exposed to the public internet.
+    api_key: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -104,15 +110,22 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
+    api_key = args.api_key or os.environ.get("OPENPI_API_KEY") or None
+
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+    if api_key:
+        logging.info("API key authentication is enabled.")
+    else:
+        logging.warning("No API key configured; anyone who can reach this port can run inference.")
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
+        api_key=api_key,
     )
     server.serve_forever()
 

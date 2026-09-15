@@ -1,8 +1,13 @@
 # Data directories.
 assets/
+checkpoint/
 checkpoints/
 data/
+dataset/
 wandb/
+
+# Runtime logs / pid files / generated API key (deploy/autodl).
+logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
