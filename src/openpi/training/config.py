@@ -1271,6 +1271,46 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    TrainConfig(
+    name="pi05_close_drawer_tianpeng_demo",          # ★ 你的 config 名字（训练命令要用它）
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",       # LoRA 微调，省显存
+        action_expert_variant="gemma_300m_lora",
+        max_token_len=112,
+    ),
+    data=LeRobotRobocasaDataConfig(
+        repo_id="close_drawer",          # norm stats 存放名，随便取
+        data_dirs=[                      # ★ 告诉 openpi 数据在哪
+            {
+                "path": "/root/autodl-tmp/openpi/dataset/single_panda_gripper.CloseDrawer",
+                "filter_key": None,       # 不过滤，用全部数据
+                "task": "CloseDrawer",
+            },
+        ],
+    ),
+    batch_size=176,
+    lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=100, peak_lr=5e-5, decay_steps=4800, decay_lr=5e-6,
+    ),
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+        max_token_len=112,
+    ).get_freeze_filter(),
+    ema_decay=None,
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "/root/autodl-tmp/openpi/checkpoint/6000/params"
+    ),
+    norm_stats_dir="/root/autodl-tmp/openpi/checkpoint/6000/assets",
+    num_train_steps=5000,
+    save_interval=1000,
+    save_train_state_interval=30000,
+    log_interval=100,
+    num_workers=12,
+),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

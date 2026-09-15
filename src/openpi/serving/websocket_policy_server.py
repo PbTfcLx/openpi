@@ -24,11 +24,16 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int | None = None,
         metadata: dict | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._policy = policy
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        # Optional shared-secret authentication. When set, clients must send an
+        # `Authorization: Api-Key <key>` header (see openpi_client.WebsocketClientPolicy).
+        # This is strongly recommended when the server is reachable from the internet.
+        self._api_key = api_key
         # Serialize policy.infer() calls. The policy keeps a JAX PRNG key that is
         # mutated on every call, so concurrent inference is not thread-safe.
         # Multiple connections may still be served concurrently at the I/O level;
@@ -46,9 +51,23 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
-            process_request=_health_check,
+            process_request=self._process_request,
         ) as server:
             await server.serve_forever()
+
+    def _process_request(
+        self, connection: _server.ServerConnection, request: _server.Request
+    ) -> _server.Response | None:
+        """Answer plain HTTP requests (health check / auth) before the websocket upgrade."""
+        if request.path == "/healthz":
+            return connection.respond(http.HTTPStatus.OK, "OK\n")
+        if self._api_key is not None:
+            # Mirrors the header sent by openpi_client.WebsocketClientPolicy(api_key=...).
+            if request.headers.get("Authorization") != f"Api-Key {self._api_key}":
+                logger.warning("Rejected connection from %s: missing or invalid API key", connection.remote_address)
+                return connection.respond(http.HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+        # Continue with the normal request handling.
+        return None
 
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
@@ -91,10 +110,3 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
-
-
-def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
-    if request.path == "/healthz":
-        return connection.respond(http.HTTPStatus.OK, "OK\n")
-    # Continue with the normal request handling.
-    return None
