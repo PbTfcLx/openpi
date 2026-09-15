@@ -214,17 +214,147 @@ when all images are masked, as a fraction of the natural action spread);
 
 ## 5. Decision rule (the point of the whole exercise)
 
-Compare **VisionΔ** of the two runs, and read the tower's `effective_rank` as a *secondary*
-signal only.
+**VisionΔ is the decision variable. `effective_rank` is corroborating evidence only** — it
+cannot pick between H1 and H2 on its own, because both predict a healthier tower at a lower
+LR. Do not gate the verdict on the rank.
 
 | outcome | interpretation |
 |---|---|
 | VisionΔ(`test_action_horizon/15000`) ≈ **0.4 – 0.75** | **H1 confirmed**: the learning rate was destroying vision. A ~3× lower peak LR / 2× smaller cumulative update preserves vision *use*. Fix = lower the LR (and re-tune the LR schedule). |
-| VisionΔ ≈ **0.03 – 0.08**, while `effective_rank` is clearly **> 14.9** (i.e. the tower looks much healthier than the collapsed one) | **H2 confirmed**: a **healthy but unused** tower — health by inertia. The LR explanation is **excluded**, and the incentive/shortcut diagnosis stands. This is the predicted outcome. |
-| VisionΔ in between (~0.1–0.3) | Both effects are present; report it as such and do not over-claim. |
+| VisionΔ ≈ **0.03 – 0.10**, with a *partially preserved* tower | **H2 confirmed, and more strongly than a fully collapsed tower would**: feature directions survive (2.8× the collapsed value at `encoded`) and are **still not used**. That decouples representation health from behavioural reliance, which is exactly the H2 claim. The LR explanation is **excluded**; the incentive/shortcut diagnosis stands. This is the predicted outcome. |
+| VisionΔ in between (~0.1–0.4) | Both effects are present; report it as such and do not over-claim. |
 
-Report, for each run: `VisionΔ`, `StateΔ`, `LangΔ`, `err/mean`, `effective_rank`, and
-`excluded_action_dims`. A bare VisionΔ without the rank is not interpretable.
+### Which layer, and the reference numbers (asked more than once)
+
+**The headline `effective_rank` figures are the `encoded` layer**: the SigLIP tower's output
+after all 27 encoder blocks, *before* the projection into the LLM's token space. Camera
+`base_0_rgb`, 84 frames. Do **not** quote `with_posemb` — the write-up's 14.9 / 115.6 are
+`encoded` (exactly 14.86 / 115.64).
+
+Measured on **the same 84 frames in the archive**, so these reference values may be compared
+against a run on any machine (the archive guarantees identical frames; `effective_rank`
+depends only on the frames and the weights):
+
+| layer | `test_new_lr/15000` (collapsed) | ratio to base | `pi05_base` | what it is |
+|---|---|---|---|---|
+| `with_posemb` | 6.91 | 0.68× | 10.15 | tower input (stem + positional embedding) |
+| `block13` | 13.14 | **0.077×** | 169.62 | encoder block 13 output (`"+mlp"`) |
+| `block20` | 12.70 | **0.068×** | 186.22 | encoder block 20 output |
+| **`encoded`** | **14.86** | **0.129×** | **115.64** | tower output, pre-projection ← the headline |
+| `tokens` | 6.52 | 0.094× | 69.61 | projected token sequence the LLM consumes |
+
+`block20` shows the *largest* relative collapse (14.7×) and `encoded` the most
+interpretable one (7.8×); quote whichever, but never mix layers between checkpoints.
+
+Rank is a sample-dependent *absolute* quantity, so always report it as a **ratio to a
+`pi05_base` measured in the same session** rather than against a hard-coded threshold — the
+old "> 14.9" gate was too lax to discriminate anything. If `pi05_base` was not run on that
+machine, the column above is a valid reference **provided `--frames-from` was used**.
+
+`effective_rank` = participation ratio of the centred patch-feature covariance: reshape
+`(B, 256, C)` → `(256B, C)`, centre across that axis, SVD, square the singular values,
+normalise to a distribution `p`, return `exp(-Σ p log p)`. It therefore measures how many
+directions the patch features span **across the whole frame set**, not within one frame — for
+the spatial-within-frame question use `within_frame_patch_sim` (mean pairwise cosine
+similarity of the 256 patches inside a frame, averaged over ≤32 frames): 0.9998 collapsed vs
+0.4634 for `pi05_base` at `encoded`.
+
+Note in `features.json` the CKA values live on the **reference** entry as
+`cka_to_reference` (the fine-tuned entry shows `-`). CKA is symmetric, so they are the
+fine-tuned-vs-base numbers either way.
+
+Report, for each run: `VisionΔ`, `StateΔ`, `LangΔ`, `err/mean`, `effective_rank` at all
+layers, `num_frames` (must be 84 when using the archive), and `excluded_action_dims`.
+
+### Proving two runs are comparable, without sharing a machine
+
+The archive pins the frames, so numbers from different machines **are** comparable — but
+prove it rather than assume it. `ablation.json` contains two quantities that depend only on
+the ground truth and **not on the model**, so they are a bit-exact fingerprint of the frame
+set:
+
+- `predict_mean_err_norm_mean` — must equal `0.6628513781264901`
+- `baseline_action_spread` — must equal
+  `[0.255950003862381, 0.21372392773628235, 0.17233122885227203, 0.06084089353680611,`
+  `0.07598678767681122, 0.07035878300666809, 0.5723248720169067, 4.37e-09, ...]`
+  (12 values; `action_horizon=20`, `num_steps=10`, `num_frames=84`)
+
+If both match, the two runs saw identical inputs and every number is directly comparable. If
+they do not, stop and re-dump — something differs in the sampling.
+
+There is also **no need to transfer a second checkpoint just to get a baseline**: the
+`test_new_lr/15000` reference (VisionΔ 0.036) was measured on exactly these archived frames.
+
+### The landscape so far (all on the same 84 frames)
+
+**Ancestry matters — these are not independent points.** Every row is fine-tuned directly from
+`pi05_base` except the child row: `lora_new_lr/11999` is a LoRA fine-tune **of
+`test_token_len/24000`** and *inherits* its tower, so it must not be counted as a separate
+observation (a mistake that was made once and corrected).
+
+| checkpoint | lr | noise | ah | step | err/mean | VisionΔ | StateΔ | rank @ `encoded` |
+|---|---|---|---|---|---|---|---|---|
+| `test_new_lr/15000` | 1.5e-4 | – | 20 | 15000 | 1.032 | 0.036 | 0.432 | 14.86 |
+| `test_action_horizon/15000` | 5e-5 | – | 20 | 15000 | 0.919 | 0.181 | 0.327 | 42.0 |
+| `w020/3000` | 1.5e-4 | ✓ | 20 | 3000 | 0.851 | 0.323 | 0.115 | 25.9 |
+| `w020/6000` | 1.5e-4 | ✓ | 20 | 6000 | 0.866 | 0.390 | 0.100 | 24.4 |
+| `state_noise/18000` | 1.5e-4 | ✓ | 20 | 18000 | 0.827 | 0.753 | 0.028 | 35.2 |
+| `test_token_len/24000` | 5e-5 | – | **50** | 24000 | – | **MISSING** | **MISSING** | **52.57** |
+| ↳ `lora_new_lr/11999` *(child of the row above)* | LoRA | | 50 | 11999 | 0.856 | 0.213 | 0.327 | 44.02 |
+
+`test_token_len/24000` holds the **healthiest tower of any fine-tuned model here (52.57)** and
+its ablation has never been run (`diagnostics/token_len_24000/` has features but **no
+`ablation.json`**). Its VisionΔ is therefore the single most informative missing number:
+(52.6, low VisionΔ) would be the strongest possible "health ≠ use" evidence, whereas
+(52.6, high VisionΔ) would support H1. It is already trained and on disk.
+
+1. **Tower health does not track vision use — but do not quote a correlation coefficient.**
+   With this few points and non-independence (one run contributes two steps, one checkpoint is
+   another's child) it swings between **+0.09** (all 6), **+0.30** (dropping the child) and
+   **+0.40** (one point per run), and at n≤6 none of them means anything. What is robust is the
+   **pairwise inversion**, and the cleanest one is ancestry-free (both are direct children of
+   `pi05_base`):
+
+   | | rank @ `encoded` | VisionΔ |
+   |---|---|---|
+   | `test_action_horizon/15000` | **42.0** (healthier tower) | 0.181 |
+   | `state_noise/18000` | **35.2** (worse tower) | **0.753** — 4.2× more |
+
+   The model with the *less* healthy tower relies on vision 4.2× **more**; H1 predicts the
+   opposite ordering. `w020/6000` (rank 24.4 → 0.390) versus `lora_new_lr` (44.0 → 0.213)
+   inverts the same way.
+
+2. **Vision and proprioception reliance trace one curve.** Spearman(VisionΔ, StateΔ) = **−1.00**
+   across the five ancestry-clean points (−0.94 if the child is included). Turning the LR down
+   and corrupting the state both slide the model along the *same* state↔vision axis. Two
+   independent knobs, one curve ⇒ the curve is a property of the task and its incentive
+   structure, not of any hyper-parameter.
+
+   Note this axis is the robust finding; the *position* of any single point on it is worth
+   about ±0.7 % on the rank side (the same `pi05_base` reference came out 115.64 in one run and
+   114.88 in another, from batching/float differences), so only differences well above that
+   should be read.
+
+So a mid-range VisionΔ is not an inconclusive result; read it as **a position on the curve plus
+a health reading**, and note that LR is a second-order lever: 3× lower peak LR bought a 5.0×
+increase in VisionΔ (0.036 → 0.181) and 2.8× in rank, but recovered only ~1/4 of the distance
+to the vision-reliant end (0.753) and left the model still state-dominated (StateΔ 0.327 >
+VisionΔ 0.181).
+
+### Interpreting `err/mean` (the tool says so itself)
+
+`fit_quality` in `ablation.json` switches bands at ratio 1.0 and 0.7: `> 1.0` → "no better than
+predicting the mean, any modality question is premature"; `> 0.7` → "only slightly better than
+a constant, expect the modality verdicts to be noisy"; otherwise trustworthy.
+
+Note that **every** run in the landscape above except the first sits in the 0.7–1.0 band
+(0.827–0.919). That caps the resolution of this comparison: treat differences of a few × and
+the *inversions* (rank vs use, knob vs curve) as the signal, and do not over-read gaps like
+0.323 vs 0.390. A more converged checkpoint (`test_action_horizon/21000` and `27000` exist)
+would raise the fit and is worth measuring if a tighter comparison is needed — and if
+VisionΔ *falls* with more training at the same LR, that is direct evidence for the
+incentive mechanism: the model progressively abandons vision as it exploits the
+proprioceptive shortcut.
 
 ### Validity warning — this is why both runs must happen on the same machine
 
