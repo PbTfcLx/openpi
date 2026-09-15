@@ -211,6 +211,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             _transforms.InterpolatedStateNoise(
                 beta_a=data_config.state_noise_beta_a,
                 beta_b=data_config.state_noise_beta_b,
+                p=data_config.state_noise_p,
             )
         ]
         if data_config.state_noise
@@ -256,6 +257,7 @@ def transform_iterable_dataset(
             _transforms.InterpolatedStateNoise(
                 beta_a=data_config.state_noise_beta_a,
                 beta_b=data_config.state_noise_beta_b,
+                p=data_config.state_noise_p,
             )
         ]
         if data_config.state_noise

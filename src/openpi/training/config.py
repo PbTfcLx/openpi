@@ -109,6 +109,10 @@ class DataConfig:
     state_noise: bool = False
     state_noise_beta_a: float = 1.0
     state_noise_beta_b: float = 2.0
+    # Probability that the corruption above is applied at all. ``1.0`` corrupts every
+    # sample (original behaviour); ``0.5`` leaves half of them clean, which calibrates the
+    # model for the clean-state regime it is evaluated in. See ``InterpolatedStateNoise``.
+    state_noise_p: float = 1.0
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -406,6 +410,7 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
     state_noise: bool = False
     state_noise_beta_a: float = 1.0
     state_noise_beta_b: float = 2.0
+    state_noise_p: float = 1.0
 
     @override
     def create(
@@ -468,6 +473,7 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
             state_noise=self.state_noise,
             state_noise_beta_a=self.state_noise_beta_a,
             state_noise_beta_b=self.state_noise_beta_b,
+            state_noise_p=self.state_noise_p,
         )
 
 
@@ -945,7 +951,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_robocasa",
-        model=pi0_config.Pi0Config(pi05=True, max_token_len=112),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=112),
         data=LeRobotRobocasaDataConfig(
             data_dirs=[
                         get_ds_meta("OpenDrawer"),
@@ -957,31 +963,238 @@ _CONFIGS = [
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=20_00,
-            peak_lr=5e-5,
-            decay_steps=58000,
-            decay_lr=5e-6,
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
-        num_train_steps=60000,
+        num_train_steps=21000,
         num_workers=12,
         save_interval=3000,
         save_train_state_interval=60000,
     ),
     TrainConfig(
-        name="pi05_robocasa_finetune_new_data",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            max_token_len=112,
-        ),
+        name="pi05_robocasa_state_noise",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=112),
         data=LeRobotRobocasaDataConfig(
-            # repo_id is used for norm stats path only; actual data comes from repo_ids.
-            repo_id="robocasa_combined",
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            state_noise=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=21000,
+        num_workers=12,
+        save_interval=3000,
+        save_train_state_interval=60000,
+    ),
+    # --- state-corruption strength sweep ------------------------------------------------
+    # ``InterpolatedStateNoise`` draws u ~ Beta(beta_a, beta_b) per sample and mixes the
+    # normalized state toward N(0, 1):  state' = (1 - u) * state + u * noise,  applied with
+    # probability ``state_noise_p``.  So the mean corruption is p * beta_a / (beta_a + beta_b)
+    # and the corruption *energy* (which is what sets how much the model can trust the state)
+    # is p * E[u^2]:
+    #
+    #   config                          beta     p      E[u]    E[u^2]
+    #   pi05_robocasa_state_noise    (1.0,2.0)  1.00    0.333   0.167   <- baseline
+    #   pi05_robocasa_state_noise_p50  (1.0,2.0) 0.50   0.167   0.083   <- mixture design
+    #   pi05_robocasa_state_noise_w020 (1.0,4.0) 1.00   0.200   0.067   (measured)
+    #   pi05_robocasa_state_noise_w060 (1.5,1.0) 1.00   0.600   0.429
+    #
+    # Everything else is byte-identical to the baseline so that checkpoints at the same step
+    # are directly comparable.  Baseline behaviour measured at step 18000 (84 frames):
+    # masking the images raises the offline error x1.57 (vision needed to fit) but zeroing the
+    # state leaves it at x1.00 (proprioception no longer needed) - the sweep is looking for the
+    # setting where BOTH ratios sit above 1.
+    #
+    # Note the clean/noisy regimes are NOT distinguishable from the input, so the model can only
+    # learn one trust-gain for the state; ``p < 1`` mainly buys calibration for the
+    # clean-state regime used at evaluation, not a per-sample switch.
+    TrainConfig(
+        name="pi05_robocasa_state_noise_p50",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=112),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            state_noise=True,
+            state_noise_beta_a=1.0,
+            state_noise_beta_b=2.0,
+            state_noise_p=0.5,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        # Screening run only. Every saved checkpoint is the full fp32 parameter tree
+        # (~12 GiB, measured), and /root/autodl-tmp has ~124 GiB free, so the stopping point
+        # is capped at 6000 (= 6 checkpoints = ~72 GiB) instead of the 21000 used by the other
+        # configs; at 21000 the 1000-step interval below would try to write ~252 GiB. This
+        # field only sets where training stops, so the first 6000 steps remain step-for-step
+        # comparable with the other configs. Raise it only after clearing disk.
+        num_train_steps=6000,
+        num_workers=12,
+        # ~6.4 s/step measured on this machine, i.e. ~1.8 h per 1000 steps (~12 GiB each), so
+        # the regime is readable at 1000/2000/3000 for ~5 h total. The w020 run showed
+        # 3000 -> 6000 barely moves (StateD 0.115 -> 0.100, VisionD 0.323 -> 0.390), so there
+        # is no need to train a variant out to 12000+ just to screen it.
+        save_interval=1000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_state_noise_w020",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=128),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            state_noise=True,
+            state_noise_beta_a=1.0,
+            state_noise_beta_b=4.0,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=21000,
+        num_workers=12,
+        save_interval=3000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_state_noise_w060",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=128),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            state_noise=True,
+            state_noise_beta_a=1.5,
+            state_noise_beta_b=1.0,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=21000,
+        num_workers=12,
+        save_interval=3000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_prompt_drop",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=112),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            prompt_drop_p=0.1,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=21000,
+        num_workers=12,
+        save_interval=3000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_prompt_drop_and_state_noise",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, max_token_len=112),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                        get_ds_meta("OpenDrawer"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
+                      ],
+            prompt_drop_p=0.1,
+            state_noise=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1e-4,
+            decay_steps=17000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=21000,
+        num_workers=12,
+        save_interval=12000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_finetune",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=112),
+        data=LeRobotRobocasaDataConfig(
             data_dirs=[
                 get_ds_meta("TurnOnStove"),
                 get_ds_meta("OpenDrawer"),
@@ -999,12 +1212,55 @@ _CONFIGS = [
                              3.0,
             ],
         ),
-        batch_size=176,
+        batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=100,
-            peak_lr=5e-5,
-            decay_steps=4800,
-            decay_lr=5e-6,
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=14000,
+            decay_lr=1.5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_robocasa/test_token_len/24000/params"),
+        norm_stats_dir="checkpoints/pi05_robocasa/test_token_len/24000/assets",
+        pytorch_weight_path="/root/autodl-tmp/pi05_weight_path",
+        num_train_steps=15000,
+        num_workers=12,
+        save_interval=3000,
+        save_train_state_interval=60000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_finetune_new_data",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            max_token_len=112,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=[
+                get_ds_meta("TurnOnStove"),
+                get_ds_meta("OpenDrawer"),
+                get_ds_meta("CloseDrawer"),
+                get_ds_meta("CloseDoubleDoor"),
+                get_ds_meta("OpenDoubleDoor"),
+                get_ds_meta("CoffeeSetupMug"),
+                # get_ds_meta("TurnSinkSpout"),
+            ],
+            dataset_weights=[21.0,
+                             2.0,
+                             1.0,
+                             2.0,
+                             3.0,
+                             3.0,
+            ],
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=11800,
+            decay_lr=1.5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=pi0_config.Pi0Config(
@@ -1016,8 +1272,8 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_robocasa/test_token_len/24000/params"),
         norm_stats_dir="checkpoints/pi05_robocasa/test_token_len/24000/assets",
-        num_train_steps=5000,
-        save_interval=1000,
+        num_train_steps=12000,
+        save_interval=3000,
         save_train_state_interval=30000,
         log_interval=100,
         num_workers=12,
@@ -1031,38 +1287,38 @@ _CONFIGS = [
         # same -- the win is memory headroom -> bigger batch -> better throughput.
         model=pi0_config.Pi0Config(
             pi05=True,
-            max_token_len=96,
+            max_token_len=112,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotRobocasaDataConfig(
             data_dirs=[
                         get_ds_meta("OpenDrawer"),
-                        # get_ds_meta("CloseDrawer", "target"),
-                        # get_ds_meta("CloseDoubleDoor", "target"),
-                        # get_ds_meta("OpenDoubleDoor", "target"),
-                        # get_ds_meta("CoffeeSetupMug", "target"),
+                        get_ds_meta("CloseDrawer"),
+                        get_ds_meta("CloseDoubleDoor"),
+                        get_ds_meta("OpenDoubleDoor"),
+                        get_ds_meta("CoffeeSetupMug"),
                       ],
         ),
         # LoRA adapters start with ~zero effect, so they need a much higher LR than full finetune
         # (peak ~1e-3 is typical for rank 16-32). Tune this to your liking.
-        batch_size=176,
+        batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-3,
-            decay_steps=12_000,
-            decay_lr=1e-4,
+            warmup_steps=600,
+            peak_lr=1.5e-4,
+            decay_steps=17_000,
+            decay_lr=1.5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         # Turn off EMA for LoRA finetuning (keeps memory low and matches the upstream low-mem pattern).
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=3200,
+        num_train_steps=21000,
         num_workers=12,
-        save_interval=5000,
+        save_interval=3000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            max_token_len=96,
+            max_token_len=112,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),

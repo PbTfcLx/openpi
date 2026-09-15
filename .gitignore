@@ -3,6 +3,8 @@ assets/
 checkpoints/
 data/
 wandb/
+# Generated output of scripts/diagnose_vision.py.
+diagnostics/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -166,3 +168,6 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local eval runs produced by .github/skills/robocasa-eval (plan + summary per run)
+runs/

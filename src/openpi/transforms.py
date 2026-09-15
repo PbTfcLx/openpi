@@ -136,26 +136,39 @@ class RandomPromptDrop(DataTransformFn):
 class InterpolatedStateNoise(DataTransformFn):
     """GR00T-style train-only state corruption (schedule-interpolated).
 
-    For each sample a corruption strength ``u ~ Beta(beta_a, beta_b)`` is drawn and the
+    With probability ``p`` a corruption strength ``u ~ Beta(beta_a, beta_b)`` is drawn and the
     normalized state is mixed toward a unit Gaussian::
 
         state' = (1 - u) * state + u * noise,    noise ~ N(0, 1)
 
-    ``u = 0`` keeps the clean state; ``u = 1`` replaces it with pure noise (which, once
-    discretized to 256 bins, saturates to a garbage text state). This mirrors the state
-    corruption in GR00T-N1's action head (``state * t + (1 - t) * noise`` with ``t``
-    sampled via a Beta) -- GR00T defaults are ``beta_a=1.5, beta_b=1.0`` (mostly heavy
-    corruption). It is applied to the *continuous* state right before pi05 discretizes it
-    into text, WITHOUT a shared diffusion timestep / time conditioning (approximation).
+    and with probability ``1 - p`` the state is left untouched. ``u = 0`` keeps the clean
+    state; ``u = 1`` replaces it with pure noise (which, once discretized to 256 bins,
+    saturates to a garbage text state). This mirrors the state corruption in GR00T-N1's action
+    head (``state * t + (1 - t) * noise`` with ``t`` sampled via a Beta) -- GR00T defaults are
+    ``beta_a=1.5, beta_b=1.0`` (mostly heavy corruption). It is applied to the *continuous*
+    state right before pi05 discretizes it into text, WITHOUT a shared diffusion timestep /
+    time conditioning (approximation).
+
+    ``p = 1.0`` corrupts every sample (the original behaviour). ``p < 1.0`` keeps a fraction of
+    samples clean, which matters for a second reason besides the mean corruption level: the
+    corrupted and clean states are *indistinguishable* at inference, so the model can only
+    learn a single, shrunken trust-gain for the state. If every training sample is corrupted
+    that gain is permanently low, and the model under-uses a perfectly clean state at
+    deployment; keeping a clean fraction calibrates the model for the regime it is evaluated
+    in. For a regime the model *can* detect, drop the state instead (see ``StateDropout``).
 
     Runs AFTER ``Normalize`` and BEFORE ``TokenizePrompt``; training-only (data loader).
     """
 
     beta_a: float = 1.0
     beta_b: float = 2.0
+    # Probability that the corruption is applied at all; 1.0 reproduces the original behaviour.
+    p: float = 1.0
 
     def __call__(self, data: DataDict) -> DataDict:
         if (state := data.get("state")) is None:
+            return data
+        if self.p < 1.0 and np.random.random() >= self.p:
             return data
         u = float(np.random.beta(self.beta_a, self.beta_b))
         if u <= 0.0:
