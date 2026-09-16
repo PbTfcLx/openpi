@@ -808,15 +808,38 @@ _CONFIGS = [
             ),
         ),
     ),
+    # TrainConfig(
+    #     name="pi05_droid",
+    #     model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+    #     data=SimpleDataConfig(
+    #         assets=AssetsConfig(asset_id="droid"),
+    #         data_transforms=lambda model: _transforms.Group(
+    #             inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+    #             outputs=[droid_policy.DroidOutputs()],
+    #         ),
+    #         base_config=DataConfig(
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    # ),
     TrainConfig(
         name="pi05_droid",
         model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
-                outputs=[droid_policy.DroidOutputs()],
+                inputs=[
+                    droid_policy.DroidInputs(model_type=ModelType.PI05)
+                ],
+                outputs=[
+                    # 注意顺序：AbsoluteActions 需要 data["state"] 和未裁剪的 actions，
+                    # 而 DroidOutputs 会把它裁剪成只剩 {"actions": 前 8 维}。
+                    # 因此必须先做 AbsoluteActions，否则推理时会 KeyError: 'state'。
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
             ),
+            
             base_config=DataConfig(
                 prompt_from_task=True,
             ),

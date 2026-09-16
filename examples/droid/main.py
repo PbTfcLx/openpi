@@ -46,6 +46,10 @@ class Args:
     remote_port: int = (
         8000  # point this to the port of the policy server, default server port for openpi servers is 8000
     )
+    # API key of the policy server, if it was started with one (see deploy/autodl/). For a server
+    # reachable over the public internet, pass e.g.
+    # `--remote_host wss://uXXXX-xxx.bjb1.seetacloud.com --remote_port 8443 --api_key <KEY>`.
+    api_key: str | None = None
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -81,7 +85,9 @@ def main(args: Args):
     print("Created the droid env!")
 
     # Connect to the policy server
-    policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
+    policy_client = websocket_client_policy.WebsocketClientPolicy(
+        args.remote_host, args.remote_port, api_key=args.api_key
+    )
 
     df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
@@ -129,9 +135,13 @@ def main(args: Args):
                     # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
                     # Ctrl+C will be handled after the server call is complete
                     with prevent_keyboard_interrupt():
-                        # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
+                        # this returns an action chunk [T, 8]: joint velocity actions (7) + gripper position (1),
+                        # where T is the action horizon of the served checkpoint (10 for pi0_droid, 15 for pi05_droid, ...)
                         pred_action_chunk = policy_client.infer(request_data)["actions"]
-                    assert pred_action_chunk.shape == (10, 8)
+                    # The DROID action layout is required (7 joints + 1 gripper) but the chunk length may vary.
+                    assert pred_action_chunk.ndim == 2 and pred_action_chunk.shape[1] == 8, (
+                        f"unexpected action chunk shape {pred_action_chunk.shape}, expected (T, 8)"
+                    )
 
                 # Select current action to execute from chunk
                 action = pred_action_chunk[actions_from_chunk_completed]
@@ -175,12 +185,11 @@ def main(args: Args):
             if not (0 <= success <= 1):
                 print(f"Success must be a number in [0, 100] but got: {success * 100}")
 
-        df = df.append(
-            {
-                "success": success,
-                "duration": t_step,
-                "video_filename": save_filename,
-            },
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame([{"success": success, "duration": t_step, "video_filename": save_filename}]),
+            ],
             ignore_index=True,
         )
 

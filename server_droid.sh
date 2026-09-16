@@ -1,0 +1,1 @@
+XLA_PYTHON_CLIENT_PREALLOCATE=false uv run  scripts/serve_policy.py --port=8000 policy:checkpoint --policy.config=pi05_droid  --policy.dir=checkpoint/pi05_droid
