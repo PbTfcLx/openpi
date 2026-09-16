@@ -84,6 +84,7 @@ import json
 import logging
 import os
 import pathlib
+import subprocess
 from typing import Any, Sequence
 
 # This script only runs a handful of forward passes, so it must not grab JAX's default 75%
@@ -126,6 +127,52 @@ STATE_KEYS = (
     "gripper_qpos",
     "joint_position",
 )
+# Width of each key in the concatenated state vector, copied from ``meta/modality.json`` of
+# the robocasa datasets. Kept next to ``STATE_KEYS`` because the archive path has no dataset
+# to read modality.json from, but still needs to locate a key's slice.
+STATE_KEY_DIMS = {
+    "end_effector_position_relative": 3,
+    "end_effector_rotation_relative": 4,
+    "base_position": 3,
+    "base_rotation": 4,
+    "gripper_qpos": 2,
+    "joint_position": 7,
+}
+STATE_DIM = sum(STATE_KEY_DIMS[key] for key in STATE_KEYS)
+
+
+def state_key_slices(keys: Sequence[str]) -> list[tuple[int, int]]:
+    """Slice bounds of ``keys`` inside the state vector built from ``STATE_KEYS`` order."""
+    bounds: dict[str, tuple[int, int]] = {}
+    start = 0
+    for key in STATE_KEYS:
+        end = start + STATE_KEY_DIMS[key]
+        bounds[key] = (start, end)
+        start = end
+    unknown = [key for key in keys if key not in bounds]
+    if unknown:
+        raise ValueError(f"Unknown state keys {unknown}; expected a subset of {list(STATE_KEYS)}")
+    return [bounds[key] for key in keys]
+
+
+def zero_state_keys(state: np.ndarray, keys: Sequence[str]) -> np.ndarray:
+    """Sets the ``keys`` slices of a *raw* state vector to 0, hiding them from the model.
+
+    Zeroing happens before ``Normalize``, which then maps the zeros through the checkpoint's
+    own statistics. For a checkpoint trained without that key the corresponding stats are the
+    padding identity (mean 0, std 1), so the normalized value is exactly the constant the
+    model saw in that slot during training, and - being the same for every frame - the channel
+    carries no information about the current step. Any other constant would have worked too;
+    zero is the one the training padding used.
+    """
+    if not keys:
+        return state
+    out = np.array(state, copy=True)
+    for start, end in state_key_slices(keys):
+        out[..., start:end] = 0.0
+    return out
+
+
 ACTION_KEYS = (
     "end_effector_position",
     "end_effector_rotation",
@@ -213,6 +260,24 @@ class Args:
     compare_config_name: str | None = None
     # Label for the reference checkpoint in figures/JSON.
     compare_label: str = "reference"
+    # Evaluate at the checkpoint's own action horizon instead of the config's default. The
+    # horizon shapes no parameter (pi0.py builds the action expert's position embeddings from
+    # it at call time), so a checkpoint trained with 50 steps can still be evaluated at 50
+    # when the config now says 20. Keep it equal to the training value: the predicted chunk
+    # length feeds every per-step metric below.
+    action_horizon: int | None = None
+    # Raw state keys (a subset of STATE_KEYS) to replace with 0 before normalisation, e.g.
+    # ``--zero-state-keys joint_position`` for a checkpoint trained without proprioceptive
+    # joints. See ``zero_state_keys`` for why 0 is the right constant.
+    zero_state_keys: list[str] = dataclasses.field(default_factory=list)
+    # Send only the first N values of the state vector, dropping the rest instead of zeroing
+    # them. A checkpoint trained with a narrower state has to be evaluated with that width:
+    # ``Normalize`` slices the statistics to the state it is given, so a 16-dim state is
+    # normalised with the first 16 stats and tokenised into 16 numbers, exactly as in training.
+    # Zeroing the tail instead keeps the vector long, which adds one constant number per frame
+    # to the prompt. Check what the checkpoint expects by looking for the padding identity
+    # (mean 0, std 1) in its ``assets/norm_stats.json`` state statistics.
+    state_dim_limit: int | None = None
 
     # Where figures and JSON summaries are written.
     output_dir: str = "diagnostics/vision"
@@ -241,11 +306,17 @@ class Args:
     # ``--num-episodes-per-task``, ``--num-frames-per-episode`` and ``--stale-offset`` are
     # ignored: the sampling decisions are already baked into the archive.
     frames_from: str | None = None
+    # Keep only the frames of these tasks when reading an archive (``--frames-from``). An
+    # archive is normally sampled across every ``single_panda_gripper.*`` task, which can be
+    # more tasks than a given checkpoint trained on. Frames from an unseen task are a trap:
+    # the policy cannot know the instruction, so it falls back on the image for the wrong
+    # reason (guessing the task), which inflates the vision verdict. Restricting to the
+    # trained tasks is the like-for-like comparison. Empty keeps every task.
+    frames_tasks: list[str] = dataclasses.field(default_factory=list)
 
     # Which experiments to run.
     run_ablation: bool = True
-    run_features: bool = True
-    # Occlusion sensitivity: hide one image region at a time and measure how much the
+    run_features: bool = True    # Occlusion sensitivity: hide one image region at a time and measure how much the
     # predicted action moves. Produces a heatmap that can be judged by eye.
     run_occlusion: bool = False
     # Occlusion grid resolution (``grid`` x ``grid`` regions per image).
@@ -261,8 +332,10 @@ class Args:
 
     # Ablation variants to run, a subset of ALL_VARIANTS. Empty means all of them.
     variants: list[str] = dataclasses.field(default_factory=list)
-    # Frames pushed through the model per jit call.
-    batch_size: int = 8
+    # Frames pushed through the model per jit call. ``0`` derives it from the free VRAM at
+    # start-up (see ``auto_batch_size``) and halves it automatically if the GPU runs out, so
+    # there is no reason to guess by hand. Set an explicit value only to cap the peak memory.
+    batch_size: int = 0
     # Flow-matching denoising steps.
     num_steps: int = 10
     # Seed for the fixed noise shared by all ablation variants.
@@ -276,6 +349,11 @@ class Args:
     max_frames_in_figure: int = 10
 
     def __post_init__(self) -> None:
+        state_key_slices(self.zero_state_keys)  # raises on unknown keys
+        if self.batch_size < 0:
+            raise ValueError(f"--batch-size must be >= 0, where 0 means auto; got {self.batch_size}")
+        if self.state_dim_limit is not None and not 1 <= self.state_dim_limit <= STATE_DIM:
+            raise ValueError(f"--state-dim-limit must be within 1..{STATE_DIM}, got {self.state_dim_limit}")
         if not self.variants:
             self.variants = list(ALL_VARIANTS)
         if not self.feature_layers:
@@ -516,6 +594,27 @@ def build_raw_obs(
     return pack_raw_obs(dataset.policy_state(ep, step), images, prompt)
 
 
+def zero_sample_state(sample: SamplePoint, keys: Sequence[str], dim_limit: int | None = None) -> SamplePoint:
+    """``sample`` with ``keys`` zeroed - and optionally truncated - in every raw observation.
+
+    Applied after the frames exist (from the dataset or from an archive) so the archive keeps
+    the true state and the decision stays a run-time flag. The probe labels are left alone:
+    they are evaluation targets, not model inputs.
+    """
+
+    def without_keys(obs: dict[str, Any]) -> dict[str, Any]:
+        state = zero_state_keys(obs["observation/state"], keys)
+        if dim_limit is not None:
+            state = state[..., :dim_limit]
+        return {**obs, "observation/state": state}
+
+    return dataclasses.replace(
+        sample,
+        obs=without_keys(sample.obs),
+        variant_obs={name: without_keys(obs) for name, obs in sample.variant_obs.items()},
+    )
+
+
 def collect_samples(args: Args, horizon: int) -> list[SamplePoint]:
     tasks = args.tasks or discover_tasks()
     root = dataset_root()
@@ -585,9 +684,63 @@ def collect_samples(args: Args, horizon: int) -> list[SamplePoint]:
 # --------------------------------------------------------------------------------------
 
 
-def resolve_horizon(config_name: str) -> int:
+def resolve_horizon(config_name: str, override: int | None = None) -> int:
     """Action horizon of a config, without instantiating the model (so: no GPU, no weights)."""
+    if override is not None:
+        return int(override)
     return int(_config.get_config(config_name).model.action_horizon)
+
+
+# Frames per forward pass when ``--batch-size`` is left at 0. Free VRAM has to cover the model
+# (3.22B params in bf16 = 6.4 GiB) plus the compiled executables, hence the footprint floor;
+# the rest is activations. Both constants are deliberately pessimistic, because guessing low
+# only costs a few seconds while guessing high costs an out-of-memory crash:
+#   measured  a batch of 8 raised RESOURCE_EXHAUSTED with 9.7 GiB free, asking for 1.08 GiB
+#             more => its true peak was above 10.8 GiB, i.e. >= 0.5 GiB per sample at ah=50
+#   measured  a batch of 2 completed with 8.9 GiB free (8.82 GiB reserved), i.e. <= 8.9 GiB
+MODEL_FOOTPRINT_GIB = 7.0
+PER_SAMPLE_GIB = 0.8
+MAX_AUTO_BATCH = 16
+
+
+def free_vram_gib() -> float | None:
+    """Free memory of the visible GPU(s), or ``None`` when the query is not possible."""
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    values = [line.strip() for line in completed.stdout.splitlines() if line.strip().isdigit()]
+    return max(float(v) for v in values) / 1024.0 if values else None
+
+
+def auto_batch_size(horizon: int) -> int:
+    """Conservative frames per call from the free VRAM, refined at run time by ``run_ablation``."""
+    free = free_vram_gib()
+    if free is None:
+        logger.warning("could not read free VRAM; starting at batch size 1")
+        return 1
+    per_sample = PER_SAMPLE_GIB * max(1.0, horizon / 50.0)
+    size = int(max(1, min(MAX_AUTO_BATCH, (free - MODEL_FOOTPRINT_GIB) // per_sample)))
+    logger.info(
+        "free VRAM %.1f GiB -> batch size %d (%.1f GiB per sample at action horizon %d)",
+        free,
+        size,
+        per_sample,
+        horizon,
+    )
+    return size
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    """True for an XLA/CUDA allocation failure, the one error worth retrying smaller."""
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "Out of memory" in text
 
 
 def _archive_meta(args: Args, samples: Sequence[SamplePoint]) -> dict[str, Any]:
@@ -639,7 +792,7 @@ def dump_samples(samples: Sequence[SamplePoint], path: str, args: Args) -> None:
     logger.info("dumped %d frames to %s (%.1f MiB)", len(samples), out.resolve(), out.stat().st_size / 2**20)
 
 
-def load_samples(path: str) -> list[SamplePoint]:
+def load_samples(path: str, keep_tasks: Sequence[str] = ()) -> list[SamplePoint]:
     """Rebuild ``SamplePoint``s from an archive written by ``--dump-frames``."""
     with np.load(path, allow_pickle=False) as archive:
         meta = json.loads(str(archive["meta_json"]))
@@ -676,6 +829,16 @@ def load_samples(path: str) -> list[SamplePoint]:
                     key=str(keys[i]),
                 )
             )
+    # ``tasks`` above is the archive's own column, hence the different parameter name.
+    wanted = {str(task) for task in np.ravel(np.asarray(keep_tasks, dtype=object))}
+    if wanted:
+        kept = [s for s in samples if s.task in wanted]
+        present = {s.task for s in kept}
+        missing = sorted(wanted - present)
+        if missing:
+            raise ValueError(f"Tasks {missing} are not in the archive; it holds {sorted({s.task for s in samples})}")
+        logger.info("kept %d of %d frames, tasks %s", len(kept), len(samples), sorted(present))
+        samples = kept
     return samples
 
 
@@ -822,8 +985,21 @@ def resolve_checkpoint_dir(checkpoint_dir: str) -> pathlib.Path:
     )
 
 
-def load_model(checkpoint_dir: str, config_name: str, label: str) -> LoadedModel:
+def load_model(
+    checkpoint_dir: str, config_name: str, label: str, action_horizon: int | None = None
+) -> LoadedModel:
     train_config = _config.get_config(config_name)
+    if action_horizon is not None and int(train_config.model.action_horizon) != int(action_horizon):
+        logger.info(
+            "[%s] overriding action_horizon %s -> %s",
+            label,
+            train_config.model.action_horizon,
+            action_horizon,
+        )
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(train_config.model, action_horizon=int(action_horizon)),
+        )
     ckpt = resolve_checkpoint_dir(checkpoint_dir)
     if not (ckpt / "params").is_dir():
         steps = [(int(p.name), p) for p in ckpt.iterdir() if p.is_dir() and p.name.isdigit()]
@@ -928,27 +1104,54 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
             for s in samples
         ]
     )
+    # The model's chunk can be longer than the recorded ground truth: a checkpoint trained at
+    # horizon 50 is often scored against frames dumped at horizon 20. Score only the steps the
+    # two have in common, so the error stays comparable across horizons.
+    gt_horizon = gt_norm.shape[1]
 
     preds: dict[str, list[np.ndarray]] = collections.defaultdict(list)
     phys: dict[str, list[np.ndarray]] = collections.defaultdict(list)
-    for start in range(0, len(samples), args.batch_size):
-        chunk = samples[start : start + args.batch_size]
-        for variant in args.variants:
-            raw = [s.variant_obs.get(variant, s.obs) for s in chunk]
-            batch = to_batch([transforms[variant](obs) for obs in raw])
-            observation = _model.Observation.from_dict(batch)
-            actions = sample_actions(
-                rng,
-                observation,
-                noise=jnp.asarray(noise[start : start + len(chunk)]),
-                num_steps=args.num_steps,
+    batch_size = max(1, int(args.batch_size))
+    start = 0
+    while start < len(samples):
+        chunk = samples[start : start + batch_size]
+        try:
+            # Buffer one chunk's results and only commit them once every variant succeeded, so
+            # a failure half-way through a chunk cannot leave ragged lists behind.
+            chunk_pred: dict[str, np.ndarray] = {}
+            chunk_phys: dict[str, np.ndarray] = {}
+            for variant in args.variants:
+                raw = [s.variant_obs.get(variant, s.obs) for s in chunk]
+                batch = to_batch([transforms[variant](obs) for obs in raw])
+                observation = _model.Observation.from_dict(batch)
+                actions = sample_actions(
+                    rng,
+                    observation,
+                    noise=jnp.asarray(noise[start : start + len(chunk)]),
+                    num_steps=args.num_steps,
+                )
+                pred = np.asarray(actions, dtype=np.float32)
+                dummy_state = np.zeros(pred.shape[:2] + (action_dim,), dtype=np.float32)
+                out = output_transform({"state": dummy_state, "actions": pred})
+                chunk_pred[variant] = pred
+                chunk_phys[variant] = np.asarray(out["actions"], dtype=np.float32)
+        except Exception as exc:  # noqa: BLE001 - only out-of-memory is handled, the rest re-raise
+            if not is_out_of_memory(exc) or batch_size <= 1:
+                raise
+            smaller = max(1, batch_size // 2)
+            logger.warning(
+                "GPU ran out of memory at batch size %d; retrying from frame %d at batch size %d",
+                batch_size,
+                start,
+                smaller,
             )
-            pred = np.asarray(actions, dtype=np.float32)
-            preds[variant].append(pred)
-            dummy_state = np.zeros(pred.shape[:2] + (action_dim,), dtype=np.float32)
-            out = output_transform({"state": dummy_state, "actions": pred})
-            phys[variant].append(np.asarray(out["actions"], dtype=np.float32))
-        logger.info("  ablation %d/%d frames", min(start + len(chunk), len(samples)), len(samples))
+            batch_size = smaller
+            continue
+        for variant in args.variants:
+            preds[variant].append(chunk_pred[variant])
+            phys[variant].append(chunk_phys[variant])
+        start += len(chunk)
+        logger.info("  ablation %d/%d frames (batch size %d)", start, len(samples), batch_size)
 
     predictions = {k: np.concatenate(v, axis=0) for k, v in preds.items()}
     physical = {k: np.concatenate(v, axis=0) for k, v in phys.items()}
@@ -963,7 +1166,7 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
     results: dict[str, Any] = {}
     for variant in args.variants:
         delta_phys = np.abs(physical[variant] - base_phys).mean(axis=(0, 1))
-        err_norm = np.abs(predictions[variant][..., :n_gt] - gt_norm).mean(axis=(0, 1))
+        err_norm = np.abs(predictions[variant][:, :gt_horizon, :n_gt] - gt_norm).mean(axis=(0, 1))
         # A change is only meaningful relative to how much the policy's own output moves
         # across frames, so express the delta in units of that natural spread.
         spread_sel = spread[:N_ENV_ACTION_DIM]
@@ -1004,6 +1207,9 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
     summary = {
         "num_frames": len(samples),
         "action_horizon": horizon,
+        "batch_size": batch_size,
+        "zero_state_keys": list(args.zero_state_keys),
+        "tasks_scored": sorted({s.task for s in samples}),
         "num_steps": args.num_steps,
         "scored_action_dims": np.flatnonzero(informative).tolist(),
         "excluded_action_dims": excluded_dims,
@@ -1019,6 +1225,9 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
         "variants": results,
     }
     summary["verdict"] = ablation_verdict(results)
+    # Hand the batch size that actually fitted back to the caller: the later experiments run
+    # right after this one and would otherwise retry the value that just ran out of memory.
+    args.batch_size = batch_size
     return summary
 
 
@@ -1683,7 +1892,7 @@ def main(args: Args) -> None:
     # checkpoint and no GPU -- see ``Args.dump_frames``.
     if args.dump_frames:
         logger.info("dumping frames for %s (no model will be loaded)", args.config_name)
-        samples = collect_samples(args, resolve_horizon(args.config_name))
+        samples = collect_samples(args, resolve_horizon(args.config_name, args.action_horizon))
         if not samples:
             raise RuntimeError("No samples collected; check --tasks and the dataset lengths.")
         dump_samples(samples, args.dump_frames, args)
@@ -1692,8 +1901,10 @@ def main(args: Args) -> None:
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    loaded = load_model(args.checkpoint_dir, args.config_name, "finetuned")
+    loaded = load_model(args.checkpoint_dir, args.config_name, "finetuned", args.action_horizon)
     horizon = loaded.config.model.action_horizon
+    if args.batch_size <= 0:
+        args.batch_size = auto_batch_size(horizon)
 
     models = [loaded]
     if args.compare_checkpoint_dir:
@@ -1702,6 +1913,7 @@ def main(args: Args) -> None:
                 args.compare_checkpoint_dir,
                 args.compare_config_name or args.config_name,
                 args.compare_label,
+                args.action_horizon,
             )
         )
 
@@ -1710,7 +1922,7 @@ def main(args: Args) -> None:
             "--frames-from is set; --tasks/--num-episodes-per-task/--num-frames-per-episode/"
             "--stale-offset are ignored, the sampling is already baked into the archive"
         )
-        samples = load_samples(args.frames_from)
+        samples = load_samples(args.frames_from, args.frames_tasks)
     else:
         logger.info("tasks: %s", args.tasks or discover_tasks())
         samples = collect_samples(args, horizon)
@@ -1718,10 +1930,21 @@ def main(args: Args) -> None:
         raise RuntimeError("No samples collected; check --tasks and the dataset lengths.")
     logger.info("collected %d frames", len(samples))
 
+    if args.zero_state_keys or args.state_dim_limit is not None:
+        logger.info(
+            "rewriting raw state: zeroing %s, dim limit %s", list(args.zero_state_keys), args.state_dim_limit
+        )
+        samples = [zero_sample_state(s, args.zero_state_keys, args.state_dim_limit) for s in samples]
+
     summary: dict[str, Any] = {
         "config_name": args.config_name,
         "checkpoint_dir": str(loaded.checkpoint_dir),
         "compare_checkpoint_dir": args.compare_checkpoint_dir,
+        "action_horizon": horizon,
+        "zero_state_keys": list(args.zero_state_keys),
+        "state_dim_limit": args.state_dim_limit,
+        "batch_size": args.batch_size,
+        "frames_tasks": list(args.frames_tasks),
         "tasks": sorted({s.task for s in samples}),
         "num_frames": len(samples),
     }
@@ -1731,6 +1954,7 @@ def main(args: Args) -> None:
         ablation = run_ablation(args, loaded, samples)
         (out_dir / "ablation.json").write_text(json.dumps(ablation, indent=2))
         plot_ablation(ablation, out_dir / "ablation.png", loaded.label)
+        summary["batch_size"] = ablation["batch_size"]
         summary["ablation_verdict"] = ablation["verdict"]
         logger.info("ablation verdict:\n%s", json.dumps(ablation["verdict"], indent=2))
 

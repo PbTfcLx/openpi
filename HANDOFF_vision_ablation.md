@@ -292,43 +292,87 @@ There is also **no need to transfer a second checkpoint just to get a baseline**
 `test_token_len/24000`** and *inherits* its tower, so it must not be counted as a separate
 observation (a mistake that was made once and corrected).
 
-| checkpoint | lr | noise | ah | step | err/mean | VisionΔ | StateΔ | rank @ `encoded` |
-|---|---|---|---|---|---|---|---|---|
-| `test_new_lr/15000` | 1.5e-4 | – | 20 | 15000 | 1.032 | 0.036 | 0.432 | 14.86 |
-| `test_action_horizon/15000` | 5e-5 | – | 20 | 15000 | 0.919 | 0.181 | 0.327 | 42.0 |
-| `w020/3000` | 1.5e-4 | ✓ | 20 | 3000 | 0.851 | 0.323 | 0.115 | 25.9 |
-| `w020/6000` | 1.5e-4 | ✓ | 20 | 6000 | 0.866 | 0.390 | 0.100 | 24.4 |
-| `state_noise/18000` | 1.5e-4 | ✓ | 20 | 18000 | 0.827 | 0.753 | 0.028 | 35.2 |
-| `test_token_len/24000` | 5e-5 | – | **50** | 24000 | – | **MISSING** | **MISSING** | **52.57** |
-| ↳ `lora_new_lr/11999` *(child of the row above)* | LoRA | | 50 | 11999 | 0.856 | 0.213 | 0.327 | 44.02 |
+| checkpoint | lr | noise | ah | step | err/mean | VisionΔ | StateΔ | LangΔ | rank @ `encoded` |
+|---|---|---|---|---|---|---|---|---|---|
+| `test_new_lr/15000` | 1.5e-4 | – | 20 | 15000 | 1.032 | 0.036 | 0.432 | 0.188 | 14.86 |
+| `test_action_horizon/15000` | 5e-5 | – | 20 | 15000 | 0.919 | 0.181 | 0.327 | 0.116 | 42.0 |
+| `test_token_len/24000` | 5e-5 | – | **50** | 24000 | 0.947 | 0.203 | 0.318 | 0.118 | 52.56 |
+| `w020/3000` | 1.5e-4 | ✓ | 20 | 3000 | 0.851 | 0.323 | 0.115 | 0.154 | 25.9 |
+| `w020/6000` | 1.5e-4 | ✓ | 20 | 6000 | 0.866 | 0.390 | 0.100 | 0.156 | 24.4 |
+| `state_noise/18000` | 1.5e-4 | ✓ | 20 | 18000 | 0.827 | 0.753 | 0.028 | 0.171 | 35.2 |
+| ↳ `lora_new_lr/11999` *(child of the row 3 above)* | LoRA | | 50 | 11999 | 0.856 | 0.213 | 0.327 | 0.156 | 44.02 |
 
-`test_token_len/24000` holds the **healthiest tower of any fine-tuned model here (52.57)** and
-its ablation has never been run (`diagnostics/token_len_24000/` has features but **no
-`ablation.json`**). Its VisionΔ is therefore the single most informative missing number:
-(52.6, low VisionΔ) would be the strongest possible "health ≠ use" evidence, whereas
-(52.6, high VisionΔ) would support H1. It is already trained and on disk.
+`test_token_len/24000` was measured and settles the question: it has the **healthiest tower of
+any fine-tuned model here (52.56)** yet VisionΔ is only **0.203**. Note it was *trained* with
+`action_horizon=50, max_token_len=104` but is *evaluated* at horizon 20 — forced, not chosen:
+the archive's `gt_chunk` is `(84, 20, 21)` and `run_ablation` only broadcasts at
+`horizon == 20`. Confirmed that `action_horizon`/`max_token_len` appear in no parameter shape
+(`pi0.py` uses them only for runtime tensors), and this checkpoint had already loaded under
+`--config-name pi05_robocasa` before. Two consequences: its `err/mean` is inflated by the
+train/eval mismatch, and the mismatch is *conservative* for H2 — a 50-step objective should
+need vision **more** than a 20-step one, yet the reliance is still low.
 
-1. **Tower health does not track vision use — but do not quote a correlation coefficient.**
-   With this few points and non-independence (one run contributes two steps, one checkpoint is
-   another's child) it swings between **+0.09** (all 6), **+0.30** (dropping the child) and
-   **+0.40** (one point per run), and at n≤6 none of them means anything. What is robust is the
-   **pairwise inversion**, and the cleanest one is ancestry-free (both are direct children of
-   `pi05_base`):
+1. **Tower health has a real but small and saturating effect; the incentive dominates.** Do not
+   quote a correlation coefficient — it swings +0.09/+0.30/+0.40 depending on which points are
+   kept, and n ≤ 6 makes all of them meaningless. The honest picture is three-tiered:
 
-   | | rank @ `encoded` | VisionΔ |
-   |---|---|---|
-   | `test_action_horizon/15000` | **42.0** (healthier tower) | 0.181 |
-   | `state_noise/18000` | **35.2** (worse tower) | **0.753** — 4.2× more |
+   - *Within the three "clean" (no state corruption) runs*, VisionΔ **is** monotone in rank:
+     `14.86 → 0.036` < `42.0 → 0.181` < `52.56 → 0.203`. So health does contribute.
+     **But this trio also varies in LR, step count and `action_horizon` simultaneously**, so it
+     does not establish that *health* is the cause — "gentler/longer training" moves both
+     quantities together. Treat it as consistent with H1's mechanism, not as proof of it.
+   - *The trend saturates and flattens*: +0.145 for the first 27 rank units, then only +0.022
+     for the next 10.5. Extrapolating to a fully healthy tower (rank ≈ 115, i.e. `pi05_base`)
+     still lands well under 0.3 — an extrapolation, not a measurement, but it puts the health
+     knob's *ceiling* below what the incentive knob already delivers.
+   - *The two knobs' reach, at the same starting point*: from `test_new_lr/15000` (rank 14.9,
+     0.036), the **incentive** knob (add state noise, same LR) reaches 0.753 — a **×20.9**
+     change; the **health/LR** knob reaches 0.203 — **×5.6**. The incentive lever reaches ~3.7×
+     further, and it does so while *lowering* tower health.
 
-   The model with the *less* healthy tower relies on vision 4.2× **more**; H1 predicts the
-   opposite ordering. `w020/6000` (rank 24.4 → 0.390) versus `lora_new_lr` (44.0 → 0.213)
-   inverts the same way.
+   And the pairwise inversion still holds and is ancestry-clean: `test_action_horizon/15000`
+   (rank 42.0) → 0.181 versus `state_noise/18000` (rank 35.2) → **0.753**, i.e. 4.2× more
+   reliance from the *worse* tower. Likewise the parent→child pair
+   (`test_token_len/24000` 52.56 → 0.203 versus its LoRA child 44.02 → 0.213) shows a **16 %
+   rank drop with no change in reliance** (Δ = 0.010, inside the noise).
+
+   Correct conclusion: **"health has a positive influence but is far from sufficient; the
+   dominant factor is the incentive/shortcut"** — not "health is irrelevant".
 
 2. **Vision and proprioception reliance trace one curve.** Spearman(VisionΔ, StateΔ) = **−1.00**
-   across the five ancestry-clean points (−0.94 if the child is included). Turning the LR down
-   and corrupting the state both slide the model along the *same* state↔vision axis. Two
-   independent knobs, one curve ⇒ the curve is a property of the task and its incentive
-   structure, not of any hyper-parameter.
+   across the six ancestry-clean points (−0.96 including the child, whose single 0.009 StateΔ
+   inversion is well inside noise). Turning the LR down and corrupting the state both slide the
+   model along the *same* state↔vision axis. Two independent knobs, one curve ⇒ the curve is a
+   property of the task and its incentive structure, not of any hyper-parameter.
+
+3. **Language reliance is a negative control — and it is never the dominant channel.** On the
+   GT-normalised scale LangΔ sits in 0.100–0.208, against VisionΔ 0.037–0.642 (17×) and StateΔ
+   0.021–0.466 (22×). **Refinement:** that 2.1× LangΔ spread is driven entirely by the floor
+   model — among the seven checkpoints with VisionΔ > 0.1, LangΔ spans **0.100–0.133 (1.3 %)**, so
+   it really is ~invariant to the knobs. The floor model is the outlier at 0.208, its *highest*
+   value: the model that ignores images leans **more** on the prompt. Ranked within each
+   checkpoint, language is #2 in 4 of 8 and #3 in 4 of 8 — **never #1**, but never negligible
+   either (10–21 % of the GT action spread).
+
+   **Caveat that must be stated: `pi05_base` has never been ablated.** It appears in
+   `features.json` only as the CKA/PCA *reference*, so every LangΔ number here describes a
+   **fine-tuned** RoboCasa checkpoint. There is no "before fine-tuning" measurement, and hence
+   **no evidence in this project that full-weight fine-tuning reduced language reliance** — the
+   question simply has not been measured.
+
+   Measuring it is cheap but needs care: `openpi-assets/checkpoints/pi05_base/` holds only
+   `params` and `params.lock`, so
+   `diagnose_vision.py` would log "`no assets/ directory; normalization will be a no-op`" and
+   **silently run with `Normalize` disabled**, making `zero_state` meaningless. Fix by symlinking
+   `params` into a directory alongside a fine-tuned checkpoint's `assets/norm_stats.json` (all
+   eight are byte-identical, verified), so the base model and the fine-tunes go through the same
+   normalisation. The reading is still limited: pi05_base never saw RoboCasa, so its images are
+   out-of-distribution and its predicted actions are off-task — the number is a *sensitivity*
+   baseline, not a capability one.
+
+   Note `blank_prompt` removes only the task description — the prompt is assembled as
+   `f"Task: {cleaned_text}, State: {state_str};\n"` (`tokenizer.py`), so the state text survives
+   being blanked and `LangΔ` is not contaminated by `StateΔ`.
 
    Note this axis is the robust finding; the *position* of any single point on it is worth
    about ±0.7 % on the rank side (the same `pi05_base` reference came out 115.64 in one run and
@@ -400,7 +444,299 @@ wrong upstream, not merely a different dataset.
 
 ---
 
-## 7. What this does NOT measure
+## 7. What each number means, and why the scales differ so much
+
+The four families are **different kinds of quantity**, which is the whole reason some sit below
+1 and some above 100.
+
+| quantity | what it is | units | sensible range |
+|---|---|---|---|
+| `VisionΔ` / `StateΔ` / `LangΔ` (= `delta_phys_over_spread`) | **ratio**: how far the action moves when that input is destroyed, divided by how much the policy's own output varies naturally | dimensionless | 0 – ~1.5 |
+| `err/mean` (= `baseline_error_vs_predict_mean`) | **ratio of errors**: the model's offline error ÷ the error of always predicting the training mean. 1.0 = has fitted nothing | dimensionless | ~0.8 – 1.1 |
+| `effective_rank` | **a count of directions**: participation ratio `exp(−Σ p log p)` of the centred patch-feature covariance's eigenvalue spectrum | dimensions | 1 … `min(N_frames·256, width)` = 1152 |
+| `within_frame_patch_sim` / `same_episode_sim` / `cross_task_sim` | **cosine similarities** between feature vectors | dimensionless | −1 … 1 |
+
+So an `effective_rank` of 186 is not "186×" anything — it says the patch features spread over
+≈186 directions out of a 1152-dimensional space (16 % of the available capacity). A collapsed
+tower uses 15. Nothing exceeds 1152 however healthy the tower, because that is the feature
+width; and the ceiling is really `min(84·256, 1152) = 1152`.
+
+The reliance ratio is defined as
+`mean_frames,steps |a_variant − a_baseline| / std_frames,steps(a_baseline)`, per action
+dimension, then averaged over dimensions — so its natural "large effect" reference point is
+**1.0**, not 0.5.
+
+> **Scale caveat, and the recommended fix — two separate problems.**
+>
+> *(a) A counting bug.* `delta_phys_over_spread` is computed as
+> `ratio = np.zeros(12); ratio[informative] = …; np.mean(ratio)`, i.e. it sums **7** informative
+> ratios but divides by **12**, diluting by `7/12 = 0.583`. The sibling statistics in the same
+> function (`delta_phys_mean`, `err_norm_mean`) *are* informative-only. So this is an
+> inconsistency in the tool, not in the physics.
+>
+> *(b) A model-dependent denominator.* The normaliser is `std` of the **baseline predictions**
+> (across frames × horizon) — a property of the *model*, so it is not the same yardstick for
+> every checkpoint. Measured: `test_new_lr/15000`'s own prediction spread is 1.2–1.3× larger
+> than every other checkpoint's. The principled reference is the **ground-truth action spread**,
+> which is a property of the data and identical for all checkpoints (computed from the archive,
+> no model needed): `[0.426, 0.441, 0.332, 0.127, 0.123, 0.156, 0.390]` for the 7 signal dims.
+>
+> **Do not "fix" (a) by multiplying by `12/7`** — that over-corrects, because (b) pushes the
+> other way. The three quantities are:
+>
+> | | definition | `test_new_lr` | `w020/6000` | `state_noise/18000` |
+> |---|---|---|---|---|
+> | as reported | `mean_12(Δ / own_spread)` | 0.036 | 0.390 | 0.753 |
+> | dims-only fix | `mean_7(Δ / own_spread)` = reported × 12/7 | 0.062 | 0.669 | 1.291 |
+> | **GT-normalised (use this)** | `mean_7(Δ / gt_spread)` | **0.037** | **0.391** | **0.642** |
+>
+> Remarkably the two errors **nearly cancel** for a typical checkpoint, so the as-reported
+> numbers land within 0–17 % of the principled ones (`state_noise/18000` is the worst case for
+> the vision channel: 0.753 reported vs 0.642). Ordering and every conclusion are unchanged —
+> Spearman(VisionΔ, StateΔ) = −0.94 on GT-normalised values versus ≈ −1.00 on reported ones.
+>
+> Practical guidance: for the write-up prefer **`mean_7(Δ / gt_spread)`**, and if you quote the
+> as-reported numbers instead, say that the normaliser is the model's own output spread. Adding
+> `delta_phys_over_gt_spread` to the tool (keeping the existing key) is the clean fix; until
+> then a checkpoint's GT-normalised value can be recovered from its `ablation.json` plus the GT
+> spread vector above, since `delta_phys_per_dim` is stored per variant.
+>
+> **Full GT-normalised table — all 8 checkpoints, same 84 frames** (transcription of the two
+> off-machine runs verified against their own reported means to ~1e-7 relative):
+>
+> | checkpoint | VisionΔ | StateΔ | LangΔ | (reported VisionΔ) | err/mean |
+> |---|---|---|---|---|---|
+> | `test_new_lr/15000` | 0.037 | 0.466 | 0.208 | 0.036 | 1.032 |
+> | `test_action_horizon/15000` | 0.185 | 0.300 | 0.100 | 0.181 | 0.947 |
+> | `lora_new_lr/11999` *(child of the row below)* | 0.204 | 0.297 | 0.133 | 0.213 | 0.856 |
+> | `test_token_len/24000` | 0.215 | 0.322 | 0.118 | 0.203 | 0.947 |
+> | `w020/3000` | 0.317 | 0.080 | 0.109 | 0.323 | 0.851 |
+> | `w020/6000` | 0.391 | 0.072 | 0.115 | 0.390 | 0.866 |
+> | `state_noise/12000` | 0.585 | 0.020 | 0.110 | 0.708 | 0.841 |
+> | `state_noise/18000` | 0.642 | 0.021 | 0.128 | 0.753 | 0.827 |
+>
+> Two consequences of moving to the principled scale:
+>
+> * **The trade-off curve is strong but no longer perfectly monotone.**
+>   Spearman(VisionΔ, StateΔ) = **−0.90** on GT-normalised values, versus **−1.00** on the
+>   reported ones (six ancestry-clean points). The small inversions are of the kind you would
+>   expect to be noise — `test_token_len/24000` (0.215 → 0.322) against its own LoRA child
+>   `lora_new_lr/11999` (0.204 → 0.297), and `state_noise/18000` (0.642 → 0.021) against an
+>   earlier step of the *same* run (0.585 → 0.020) — but at least part of the reported −1.00
+>   was an artifact of the model-dependent denominator. **Do not present the reported −1.00 as
+>   a law.** The trend is still very strong: VisionΔ spans 0.037–0.642 (17×) while StateΔ moves
+>   monotonically opposite.
+> * **The denominator distortion is dimension-dependent, not a global factor.** Per-dimension
+>   `own_spread / gt_spread` is **0.32–0.65 on the six arm dims but 1.16–1.47 on dim 6
+>   (`gripper_close`), for every one of the eight checkpoints.** So on the arm the models are
+>   *under*-dispersed relative to the demos, and on the gripper they are *over*-dispersed —
+>   which is exactly why a single "multiply by 12/7" style correction cannot be right. It also
+>   means the gripper channel is where the models' own variability exceeds the data's, so the
+>   arm dims and the gripper dim get different weights under the two scalings.
+>
+> Two-knob comparison on the corrected scale, from `test_new_lr/15000` (VisionΔ 0.037):
+> the **incentive** knob reaches 0.642 (**×17.4**) while the **health/LR** knob reaches
+> 0.215 (**×5.8**) — the incentive lever reaches ~3× further, and it does so while *lowering*
+> tower health. The language control is unchanged and still clean: LangΔ spans 0.100–0.208
+> (2.1×) against VisionΔ's 17×.
+
+>
+> Note the normaliser is **not** removable stochasticity. The flow-matching noise is already
+> deterministic *and shared across variants* — `noise = [noise_for(s.key, horizon, action_dim,
+> seed) for s in samples]` is built once and passed to `sample_actions` identically for the
+> baseline and every counterfactual, with a single fixed `rng = jax.random.key(args.seed)`. So
+> the baseline/variant comparison is already perfectly paired; the "spread" being divided by is
+> the policy's output variation *across different frames and scenes*, i.e. the scale of the
+> task's action space — the unit, not noise. Dividing by it is what makes a bare Δ meaningful.
+
+
+## 8. Does VisionΔ actually matter? (task success, 5 tasks × 100 episodes each)
+
+**Ancestry discipline applies here too.** `test_lora_new_lr/*` is a LoRA child of
+`test_token_len/24000`, so it is **not an independent point**: its VisionΔ (0.204) is its
+parent's (0.215) inherited rather than produced by the LoRA run. (Three separate times an
+inherited checkpoint has been mistaken for an independent observation in this project — always
+check `checkpoint_dirs` and the parent run before adding a row.) Now that the parent's success
+rate exists, the pair can be read as a **paired comparison** instead of a new row, and it is a
+clean null: parent 61.0 % → child 62.2 % (**+1.2 pts, 0.39 σ**) with VisionΔ 0.215 → 0.204.
+Fine-tuning with LoRA changed neither measurable quantity.
+
+**Four independent runs** have both a measured VisionΔ and a measured success rate:
+
+| checkpoint | intervention | VisionΔ (GT-norm) | success | err/mean | per-task (5 × 100 eps) |
+|---|---|---|---|---|---|
+| `test_new_lr/15000` | peak_lr 1.5e-4 | **0.037** | **48.0 %** | 1.032 | 52, 18, 69, 99, **2** |
+| `test_action_horizon/15000` | peak_lr 5e-5, **no noise** | **0.185** | **60.6 %** | 0.947 | 66, 28, 80, 100, 29 |
+| `test_token_len/24000` | peak_lr 5e-5, **no noise**, ah 50 | **0.215** | **61.0 %** | 0.947 | 78, 28, 79, 100, 20 |
+| `test_state_noise/18000` | + state noise | **0.642** | **63.2 %** | 0.827 | 81, 27, 82, 100, 26 |
+
+(Also measured, same run as the first row: `test_new_lr/18000` = 51.0 % — a within-run
+consistency check, not a new point.) `Spearman(VisionΔ, success) = +1.00` across the four, and
+the pre-registered prediction of ≈61–62 % for `test_token_len/24000` was confirmed at 61.0 %.
+
+**The state-noise confound is removed twice over.** *Two* of the four reach their VisionΔ with
+**no state noise at all** — `test_action_horizon` (60.6 %) and `test_token_len` (61.0 %), which
+differ in `action_horizon` (20 vs 50) and step (15000 vs 24000) yet land 0.1 σ apart. So the
+relation is not "state noise happens to act as a regulariser".
+
+**The relationship is a threshold, not a gradient.** Pairwise differences, 500 episodes per arm,
+unpaired (SE of a difference ≈ 3.1 pts):
+
+| comparison | Δ success | significance |
+|---|---|---|
+| 0.037 → 0.185 | **+12.6 pts** | **4.0 σ** |
+| 0.037 → 0.215 | +13.0 pts | 4.2 σ |
+| 0.037 → 0.642 | +15.2 pts | 4.9 σ |
+| 0.185 → 0.215 | +0.4 pts | 0.1 σ |
+| 0.185 → 0.642 | +2.6 pts | 0.8 σ |
+| 0.215 → 0.642 | +2.2 pts | 0.7 σ |
+
+So crossing off the floor is solid (p < 1e-4), while **a 3.5× range of VisionΔ above the floor
+buys only 2.6 success points and none of those three models is resolvable from another**. They
+also trade places task-by-task (best on task 1 is `state_noise` at 81 %, worst on task 5 is also
+`state_noise` at 26 %), which is what "no real difference" looks like.
+
+**Consequence, and it reverses the earlier recommendation.** Of the total +15.2 pts available,
+**the LR intervention alone delivers +12.6 pts (83 %)**, with no state noise at all. State noise
+buys a 3.5× larger VisionΔ and only +2.6 further points (0.8 σ, not resolvable). So:
+
+> VisionΔ is a useful *diagnostic* — a model at the floor (≈0.04) loses ~13 success points
+> versus one that merely clears ≈0.19 — but pushing VisionΔ toward the state-noise ceiling does
+> **not** buy further performance. **Lowering the peak LR is the efficient fix; state corruption
+> is not**, despite moving VisionΔ 17×.
+
+**Critical caveat for the write-up: VisionΔ is confounded with offline fit quality.** Across
+these four rows, `err/mean` is *equally* monotone with success (1.032 → 48.0 %, 0.947 → 60.6 %,
+0.947 → 61.0 %, 0.827 → 63.2 %), and across all eight checkpoints VisionΔ and `err/mean` improve
+together. So the +13 points cannot be attributed to *seeing* rather than to *fitting the
+demonstrations better* (or to stronger regularisation). The floor row is the extreme case:
+VisionΔ 0.037 coincides with `err/mean` 1.03, i.e. a model that has not fitted at all.
+
+**The step sweep came back null — the model is stationary by step 15000.**
+`test_action_horizon` 15000 → 21000, same run / same LR schedule / same `action_horizon`, +40 %
+steps:
+
+| quantity | 15000 | 21000 | change |
+|---|---|---|---|
+| VisionΔ (reported) | 0.1806 | 0.1787 | −1.1 % |
+| StateΔ | 0.3266 | 0.3280 | +0.4 % |
+| LangΔ | 0.1158 | 0.1090 | −5.9 % |
+| `err/mean` | 0.919 | 0.927 | **+0.9 %** |
+| `effective_rank` @ `encoded` | 42.00 | 41.16 | −2.0 % |
+
+Two consequences. First, **the "progressive abandonment of vision" prediction is not supported**
+in this window (VisionΔ does not fall) — but the test had **no power**, because *nothing* moved,
+so it neither confirms nor refutes the mechanism. Second, **the experiment failed to break the
+`err/mean` confound below**, which needs the two quantities to move in *opposite* directions;
+here they both stood still.
+
+Note also that `err/mean` did not improve with 40 % more training (0.919 → 0.927). Across all
+checkpoints `err/mean` sits in 0.827–1.03, so **this metric appears to bottom out near ≈0.83** in
+this setup — worth stating in the write-up, since it means the above-floor models may all be at
+an irreducible floor rather than differing in "how well fitted" they are.
+
+**Correction, after `w020/6000` (49.0 %) and three p50 checkpoints were measured: none of the
+candidate variables predicts success.** Updated table (success = 5 tasks × 100 episodes):
+
+| checkpoint | lr | noise E[u²] | steps | err/mean | VisionΔ | success |
+|---|---|---|---|---|---|---|
+| `test_new_lr/15000` | 1.5e-4 | – | 15000 | 1.032 | 0.037 | 48.0 % |
+| `test_new_lr/18000` | 1.5e-4 | – | 18000 | – | – | 51.0 % |
+| **`w020/6000`** | 1.5e-4 | 0.067 | **6000** | **0.866** | **0.391** | **49.0 %** |
+| `test_action_horizon/15000` | 5e-5 | – | 15000 | 0.947 | 0.185 | 60.6 % |
+| `test_token_len/24000` | 5e-5 | – | 24000 | 0.947 | 0.215 | 61.0 % |
+| `lora_new_lr/11999` | LoRA of token_len | – | 11999 | 0.856 | 0.204 | 62.2 % |
+| `state_noise/18000` | 1.5e-4 | 0.167 | 18000 | 0.827 | 0.642 | 63.2 % |
+
+`w020/6000` breaks **both** proposed explanations at once: it has the 2nd-highest VisionΔ yet the
+2nd-lowest success, and its `err/mean` (0.866) is *better* than three models that beat it by
+11–12 points. Rank correlations over all seven rows:
+
+* Spearman(VisionΔ, success) = **+0.60** (n = 6) — was +1.00 before this point was added;
+* Spearman(err/mean, success) = **−0.68** (n = 7) — the best of the three, still weak;
+* Spearman(steps, success) = +0.29 (n = 7).
+
+**So do not claim VisionΔ predicts success.** What survives are the two *step-matched* pairs,
+where only one factor differs:
+
+| matched pair | Δ success |
+|---|---|
+| 15000 steps: lr 1.5e-4 (48.0 %) → lr 5e-5 (60.6 %) | **+12.6 pts** |
+| 18000 steps: no noise (51.0 %) → noise E=0.167 (63.2 %) | **+12.2 pts** |
+
+The pattern in the table — every success ≥ 60 % has **both** ≥ 12000 steps **and** an
+intervention, while `w020/6000` has the intervention but only 6000 steps — suggests
+"enough training **and** an intervention" is the requirement, with VisionΔ merely tracking the
+intervention. That is a hypothesis, not a result, and the cheapest test is to evaluate
+**`state_noise/12000`** (intervention, 12000 steps, VisionΔ already 0.585): if it lands near
+62 %, the step threshold sits between 6000 and 12000.
+
+### The p50 run: its design purpose is refuted, but it yields a clean training trajectory
+
+`pi05_robocasa_state_noise_p50` (Beta(1,2) with p = 0.5, i.e. half the samples keep a **clean**
+state; effective noise energy 0.083, between w020's 0.067 and `state_noise`'s 0.167):
+
+| checkpoint | err/mean | VisionΔ | StateΔ | LangΔ |
+|---|---|---|---|---|
+| p50/1000 | 0.878 | **0.175** | 0.115 | 0.085 |
+| p50/2000 | 0.849 | **0.291** | 0.074 | 0.130 |
+| p50/3000 | 0.854 | **0.305** | 0.058 | 0.136 |
+
+* **The "calibration" hypothesis fails.** The idea was that never seeing a clean state (p = 1.0)
+  permanently depresses the state trust-gain, so p = 0.5 should reach a *higher* StateΔ at the
+  same VisionΔ. At matched VisionΔ, p50/3000 (0.305 → StateΔ 0.058) sits *below* w020/3000
+  (0.317 → StateΔ 0.080). It does not leave the trade-off curve; it is slightly under it.
+* **A third independent run showing VisionΔ grows during training under the incentive:**
+  0.175 → 0.291 → 0.305 over 1000 → 2000 → 3000 steps, with StateΔ falling 0.115 → 0.074 →
+  0.058. Most of the growth happens in the first 2000 steps. This corroborates the w020
+  (+23 % over 3000→6000) and `state_noise` (+9.7 % over 12000→18000) trajectories.
+* **`LangΔ` is *not* invariant early in training**: p50/1000 reads 0.085, below every converged
+  checkpoint (which span 0.100–0.208), rising to 0.130/0.136 by 2000–3000 steps. So the
+  invariance claim holds only among converged models.
+* These three checkpoints have too few steps for their success rates to be informative, so
+  evaluating them is not worth the simulator time.
+
+### `max_token_len` is not a confounder (checked, no effect)
+
+The existing ablations used mixed token budgets (`pi05_robocasa` / `..._state_noise` = 112,
+`..._state_noise_w020` = 128) and mt = 112 truncates the `CoffeeSetupMug` prompt — and since the
+state text follows the task description, the tail that gets cut is part of the **state** string.
+Measured directly on p50/3000 at both settings: VisionΔ **+0.0 %**, LangΔ **+0.0 %**,
+err/mean −0.0 %, StateΔ −1.9 %. So the mixed mt across the eight ablations is a non-issue.
+
+**How to break the confound (unchanged): evaluate `w020/6000`.** The requirement is a pair with *matched fit
+quality but different VisionΔ*. Exactly one such pair exists in the checkpoints at hand, and one
+half of it is already measured:
+
+| | `err/mean` | VisionΔ | success |
+|---|---|---|---|
+| `lora_new_lr/11999` | 0.856 | 0.204 | **62.2 %** (known) |
+| `w020/6000` | 0.866 | **0.391** | **?** |
+
+Fit differs by 1.2 %, VisionΔ by 1.92×. So one eval run settles it:
+
+* success clearly above 62 % ⇒ at matched fit, more VisionΔ means more success ⇒ **VisionΔ is the
+  operative variable and the confound is broken**;
+* success ≈ 62 % ⇒ 1.9× VisionΔ at matched fit buys nothing ⇒ the threshold story holds and
+  `err/mean` is the better predictor.
+
+Caveat: `w020/6000` has only 6000 steps versus `lora_new_lr`'s 11999, so step is not matched —
+but `err/mean` is, which is the quantity at issue. (A second, weaker pair exists —
+`w020/3000` at err 0.851 / VisionΔ 0.317 versus `state_noise/12000` at err 0.841 / VisionΔ 0.585,
+1.8× — but it needs *two* evals and has a worse step mismatch: 3000 vs 12000.)
+
+**The floor effect rests on a single checkpoint, and that is the sharpest form of the problem.**
+`test_new_lr/15000` is the *only* checkpoint with `err/mean > 1` (1.032) **and** the only one at
+the VisionΔ floor (0.037); every other checkpoint lies in 0.827–0.947. So the 4 σ floor effect is
+equally consistent with "**a model that has not fitted performs badly**" as with "a model that
+does not see performs badly". State it as a limitation, or buy the `w020/6000` point above.
+
+Limits to state in the write-up: n = 4, and the four rows must share the **same 5 tasks** (the
+LoRA row was annotated "old tasks" — the others need confirming); the eval harness changed
+during this project, so confirm a common protocol; and the floor row's VisionΔ coincides with
+`err/mean ≈ 1.03`.
+
+## 9. What this does NOT measure
 
 `VisionΔ` is **behavioural reliance on the recorded frames**. It is not task success and not
 object awareness. A model can have high VisionΔ and still mechanically replay a trajectory.
