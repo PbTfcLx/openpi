@@ -1,9 +1,23 @@
+# ruff: noqa: E402 - the thread limits below must be applied before numpy/MuJoCo import.
 import collections
 import dataclasses
+import faulthandler
 import logging
 import multiprocessing
+import os
 import pathlib
 import queue
+import signal
+import time
+
+# /etc/profile.d/autodl.env.sh exports OMP_NUM_THREADS=MKL_NUM_THREADS=$(nproc) (=25
+# here). Every spawned worker inherits it, so --num_envs 12 would try to run 12 * 25
+# OpenMP threads on 25 cores. MuJoCo's physics and the offscreen renderer are
+# OpenMP-based, and that much oversubscription is a known cause of random crashes
+# (and of large slowdowns). Cap the pools per process before they get initialized;
+# override with OPENPI_EVAL_THREADS=n.
+for _thread_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_thread_var] = os.environ.get("OPENPI_EVAL_THREADS", "1")
 
 import cv2
 import imageio
@@ -31,7 +45,7 @@ class Args:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    env_name: str = "robocasa_panda_omron/CloseDoubleDoor_PandaOmron_Env"
+    env_name: str = "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 100  # Number of rollouts per task
     max_steps: int = 720
@@ -39,10 +53,10 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/robocasa/test_token_len/checkpoint-21000/videos/closedoubledoor"  # Path to save videos
+    video_out_path: str = "data/robocasa/pi05_base/videos/opendrawer"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
-    num_envs : int = 3
+    num_envs : int = 12
 
     #################################################################################################################
     # Multi-env / video recording
@@ -50,12 +64,18 @@ class Args:
     save_video: bool = True  # Whether to save per-episode replay videos
     steps_per_render: int = 1  # Record a video frame every N env steps
     num_retries: int = 3  # Re-run an episode this many times if it hits NaN
+    max_episode_restarts: int = 3  # Re-queue an episode in a fresh worker if its worker died or raised; after this
+    # many losses the episode is counted as a failure instead of aborting the eval
+    max_worker_restarts: int = 3  # How often a worker slot may be restarted after crashing; guards against a crash loop
+    one_episode_per_worker: bool = True  # Retire the worker process + env after every episode (~15% slower). Needed for
+    # reproducible runs: a reused env makes an episode's outcome depend on which episodes ran before it in that process
 
     #################################################################################################################
     # Determinism / reproducibility
     #################################################################################################################
     deterministic: bool = True  # Pin action noise to (episode seed, replan index) so runs are reproducible and different checkpoints can be compared on identical scenes
     results_out_path: str = ""  # Optional TSV to dump per-episode results (episode_idx, seed, success, length); keep the same seed/num_trials when comparing checkpoints
+    run_start_epoch: float = 0.0  # Internal: wall-clock start of this run, set by eval_robocasa; used to tell this run's videos from leftovers of earlier runs
 
 def get_robocasa_env_fn(
     env_name: str,
@@ -410,6 +430,19 @@ def _run_episode(
             pathlib.Path(args.video_out_path)
             / f"rollout_{episode_idx:04d}_{suffix}.mp4"
         )
+        # The file name encodes the outcome, so an episode that flipped between two
+        # runs leaves *both* `..._success.mp4` and `..._failure.mp4` behind and the
+        # directory looks like one episode produced two contradictory videos. Drop
+        # the other outcome if it was written by an earlier run; a re-run inside the
+        # current run (worker died -> episode re-queued) keeps both, by design.
+        for other in ("success", "failure"):
+            stale = video_path.with_name(f"rollout_{episode_idx:04d}_{other}.mp4")
+            if stale != video_path and stale.exists() and stale.stat().st_mtime < args.run_start_epoch:
+                try:
+                    stale.unlink()
+                    logging.info(f"Removed stale {stale.name} (written by an earlier run)")
+                except OSError as e:  # noqa: BLE001 - cleanup is best-effort
+                    logging.warning(f"Could not remove stale {stale}: {e}")
         try:
             imageio.mimwrite(video_path, replay_images, fps=40, codec="libx264")
         except Exception as e:  # noqa: BLE001 - video is best-effort
@@ -426,11 +459,22 @@ def _run_worker(
 ) -> None:
     """Worker process: owns one env and one policy client.
 
-    Pulls the next episode index from the shared ``task_queue`` as soon as the
-    previous episode finishes, so a fast worker keeps picking up work instead of
-    idling behind a slow worker. Episode indices still map to deterministic seeds
-    via ``seed + episode_idx``.
+    The parent hands this worker one episode at a time through its private
+    ``task_queue`` and the worker reports back with
+    ``(worker_id, episode_idx, success, length)``. Episode indices map to
+    deterministic seeds via ``seed + episode_idx``.
+
+    Every per-episode failure is *reported* instead of silently killing the
+    process, so the parent can re-queue that one episode. The only failure the
+    parent cannot be told about is a hard crash (segfault in MuJoCo/EGL, OOM
+    kill): there faulthandler dumps the C-level traceback to stderr, and the
+    parent notices the missing report and reschedules the episode.
     """
+    # A crash that takes the process down (corrupt EGL context, driver bug, OOM
+    # kill) never reaches Python's exception handling, so the log would otherwise
+    # end with nothing but "worker died". This prints the actual faulting stack.
+    faulthandler.enable()
+
     env = None
     try:
         client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
@@ -439,49 +483,53 @@ def _run_worker(
         while True:
             episode_idx = task_queue.get()
             if episode_idx is None:
-                # All episodes have already been claimed by other workers.
+                # Parent is shutting this worker down.
                 break
 
             seed = args.seed + episode_idx if args.seed is not None else None
             success, length = False, 0
-            for attempt in range(args.num_retries):
-                try:
+            try:
+                for attempt in range(args.num_retries):
                     success, length, hit_nan, render_dead = _run_episode(
                         env, client, args, seed, episode_idx, attempt
                     )
-                except Exception as e:  # noqa: BLE001 - report per-episode failures
-                    logging.error(f"Worker {worker_id} failed on episode {episode_idx}: {e}")
-                    result_queue.put((episode_idx, None, str(e)))
-                    return
-                if not (hit_nan or render_dead):
-                    break
-                if attempt < args.num_retries:
-                    if render_dead:
-                        # A dead renderer usually means this worker's offscreen
-                        # EGL/GL context is corrupted. Reusing the same env will
-                        # most likely stay broken, so build a fresh one (and with
-                        # it a fresh render context).
-                        try:
-                            env.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        env = _make_env(args.env_name, args.max_steps)
+                    if not (hit_nan or render_dead):
+                        break
+                    if attempt + 1 < args.num_retries:
+                        if render_dead:
+                            # A dead renderer usually means this worker's offscreen
+                            # EGL/GL context is corrupted. Reusing the same env will
+                            # most likely stay broken, so build a fresh one (and with
+                            # it a fresh render context).
+                            try:
+                                env.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            env = _make_env(args.env_name, args.max_steps)
+                        reason = "NaN state" if hit_nan else "dead renderer"
+                        logging.warning(
+                            f"Episode {episode_idx} attempt {attempt + 1}/{args.num_retries} "
+                            f"hit {reason}, retrying..."
+                        )
+                else:
                     reason = "NaN state" if hit_nan else "dead renderer"
-                    logging.warning(
-                        f"Episode {episode_idx} attempt {attempt + 1}/{args.num_retries} "
-                        f"hit {reason}, retrying..."
+                    # Retry budget exhausted and the episode never recovered.
+                    logging.error(
+                        f"[ALARM] Episode {episode_idx}: {reason} persisted after "
+                        f"{args.num_retries} retries, marking as failure"
                     )
-            else:
-                reason = "NaN state" if hit_nan else "dead renderer"
-                # Retry budget exhausted and the episode never recovered.
-                logging.error(
-                    f"[ALARM] Episode {episode_idx}: {reason} persisted after "
-                    f"{args.num_retries} retries, marking as failure"
-                )
-            result_queue.put((episode_idx, bool(success), length))
+            except Exception as e:  # noqa: BLE001 - report per-episode failures
+                logging.error(f"Worker {worker_id} failed on episode {episode_idx}: {e}")
+                result_queue.put((worker_id, episode_idx, None, str(e)))
+                # The env is in an undefined state now, so exit instead of
+                # poisoning the following episodes; the parent re-queues this
+                # episode and starts a fresh worker.
+                return
+
+            result_queue.put((worker_id, episode_idx, bool(success), length))
     except Exception as e:  # noqa: BLE001 - report setup failures to the parent
         logging.error(f"Worker {worker_id} failed: {e}")
-        result_queue.put((worker_id, None, f"worker setup failed: {e}"))
+        result_queue.put((worker_id, -1, None, f"worker setup failed: {e}"))
     finally:
         if env is not None:
             try:
@@ -517,6 +565,16 @@ def eval_robocasa(args: Args) -> None:
     np.random.seed(args.seed)
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    # Remember when this run started: the video writer needs it to distinguish
+    # leftovers of an earlier run from videos of the current one.
+    args.run_start_epoch = time.time()
+    leftovers = sorted(pathlib.Path(args.video_out_path).glob("rollout_*.mp4"))
+    if leftovers:
+        logging.warning(
+            f"{args.video_out_path} already contains {len(leftovers)} rollout_*.mp4 from earlier runs. "
+            f"They will be replaced as this run's episodes finish; pass a fresh --args.video-out-path "
+            f"(or clear the directory) if you want each run kept separate."
+        )
 
     results_file = None
     if args.results_out_path:
@@ -529,62 +587,191 @@ def eval_robocasa(args: Args) -> None:
     total_episodes = int(args.num_trials_per_task)
     n_workers = min(n_envs, total_episodes)
 
-    # Each worker owns its own env and policy client. Workers pull the next
-    # episode index from a shared queue, so a fast worker immediately starts a
-    # new episode instead of idling behind a slow one.
+    # The parent is the only scheduler: it hands each worker exactly one episode
+    # at a time through that worker's own queue and only re-fills the slot once
+    # the worker reports back. Nothing races for work, so the parent always knows
+    # which episode a worker had in flight - including when the worker is killed
+    # outright (segfault / OOM kill) and never reports anything at all. Losing a
+    # worker therefore costs at most that one episode, which gets re-queued into a
+    # fresh worker instead of ending the whole evaluation.
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    task_queue = ctx.Queue()
-    for episode_idx in range(total_episodes):
-        task_queue.put(episode_idx)
-    for _ in range(n_workers):
-        task_queue.put(None)  # one termination sentinel per worker
+    # One private task queue per *process*, re-created on every spawn, so a stale
+    # shutdown sentinel can never be read by the wrong worker.
+    task_queues: dict[int, object] = {}
 
-    workers = [
-        ctx.Process(target=_run_worker, args=(worker_id, task_queue, args, result_queue))
-        for worker_id in range(n_workers)
-    ]
-
-    for worker in workers:
-        worker.start()
+    pending = collections.deque(range(total_episodes))  # episodes not claimed yet
+    assigned: dict[int, int | None] = dict.fromkeys(range(n_workers))
+    live: dict[int, multiprocessing.process.BaseProcess] = {}
+    recycled: set[int] = set()  # slots whose worker is exiting on purpose after one episode
+    completed: dict[int, tuple[bool, int]] = {}
+    abandoned: dict[int, str] = {}
+    episode_restarts: collections.Counter = collections.Counter()
+    worker_restarts: collections.Counter = collections.Counter()
 
     pbar = tqdm.tqdm(total=total_episodes, desc="Episodes")
-    successes: list[bool] = []
-    try:
-        while len(successes) < total_episodes:
+
+    def _write_result(episode_idx: int, success: bool, length: int) -> None:
+        if results_file is None:
+            return
+        seed = args.seed + episode_idx if args.seed is not None else -1
+        results_file.write(f"{episode_idx}\t{seed}\t{int(success)}\t{length}\n")
+        results_file.flush()
+
+    def _abandon(episode_idx: int, reason: str) -> None:
+        """Give up on one episode without giving up on the whole evaluation."""
+        abandoned[episode_idx] = reason
+        pbar.update(1)
+        logging.error(f"[ALARM] Episode {episode_idx} abandoned ({reason}); counted as a failure")
+        _write_result(episode_idx, False, 0)
+
+    def _requeue(episode_idx: int, reason: str) -> None:
+        episode_restarts[episode_idx] += 1
+        if episode_restarts[episode_idx] > args.max_episode_restarts:
+            _abandon(episode_idx, f"{reason}; already restarted {episode_restarts[episode_idx] - 1} time(s)")
+        else:
+            logging.warning(f"Re-queuing episode {episode_idx}: {reason}")
+            pending.append(episode_idx)
+
+    def _assign(worker_id: int) -> None:
+        """Hand the next pending episode to an idle, live worker."""
+        if assigned[worker_id] is not None or worker_id not in live or not pending:
+            return
+        episode_idx = pending.popleft()
+        assigned[worker_id] = episode_idx
+        task_queues[worker_id].put(episode_idx)
+
+    def _spawn(worker_id: int) -> bool:
+        if worker_restarts[worker_id] > args.max_worker_restarts:
+            logging.error(
+                f"Worker slot {worker_id} crashed {worker_restarts[worker_id] - 1} times, not restarting it"
+            )
+            return False
+        worker_restarts[worker_id] += 1
+        task_queues[worker_id] = ctx.Queue()
+        proc = ctx.Process(
+            target=_run_worker,
+            args=(worker_id, task_queues[worker_id], args, result_queue),
+        )
+        proc.start()
+        live[worker_id] = proc
+        return True
+
+    def _describe_exit(proc) -> str:
+        code = proc.exitcode
+        if code is not None and code < 0:
             try:
-                episode_idx, success, length = result_queue.get(timeout=2.0)
+                return f"killed by {signal.Signals(-code).name} (exitcode {code})"
+            except ValueError:
+                return f"exitcode {code}"
+        return f"exitcode {code}"
+
+    def _handle(worker_id: int, episode_idx: int, success: bool | None, length) -> None:
+        """Process one worker report and immediately refill that worker's slot."""
+        if episode_idx < 0:
+            # The worker could not even build its env / reach the policy server,
+            # so there is no episode to re-queue - the reap logic restarts it.
+            logging.error(f"Worker {worker_id} could not start: {length}")
+            return
+        assigned[worker_id] = None
+        if episode_idx in completed or episode_idx in abandoned:
+            # Duplicate report: an episode re-queued after a worker died also
+            # made it back from the original worker. Keep the first result.
+            return
+        if success is None:
+            _requeue(episode_idx, f"worker {worker_id} raised: {length}")
+            return
+        completed[episode_idx] = (bool(success), int(length))
+        pbar.update(1)
+        _write_result(episode_idx, bool(success), int(length))
+        if args.one_episode_per_worker:
+            # Retire this worker together with its env; the reap loop starts a
+            # pristine process+env for the next episode. The sentinel makes the
+            # worker close its env and exit cleanly (no leaked EGL context).
+            recycled.add(worker_id)
+            task_queues[worker_id].put(None)
+        else:
+            _assign(worker_id)
+
+    for worker_id in range(n_workers):
+        if _spawn(worker_id):
+            _assign(worker_id)
+
+    try:
+        while len(completed) + len(abandoned) < total_episodes:
+            # 1. Drain every report that is already waiting *before* looking for
+            #    dead workers, so a worker that reported and then exited is not
+            #    mistaken for one that lost its episode to a crash.
+            try:
+                _handle(*result_queue.get(timeout=2.0))
             except queue.Empty:
-                if all(not worker.is_alive() for worker in workers):
-                    raise RuntimeError(
-                        "All worker processes died before completing all episodes."
+                pass
+            else:
+                while True:
+                    try:
+                        _handle(*result_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+            # 2. Reap the workers that are gone. Because the parent owns every
+            #    assignment, a worker that died without reporting still has its
+            #    episode recorded in ``assigned`` - that is the episode to
+            #    rescue, and it is the whole point of this loop.
+            for worker_id in list(live):
+                proc = live[worker_id]
+                if proc.is_alive():
+                    continue
+                proc.join()
+                del live[worker_id]
+                orphan = assigned[worker_id]
+                assigned[worker_id] = None
+                if worker_id in recycled:
+                    # Retired after one episode on purpose, so this is not a crash:
+                    # give the slot back its full restart budget.
+                    recycled.discard(worker_id)
+                    worker_restarts[worker_id] = 0
+                elif orphan is None:
+                    logging.warning(
+                        f"Worker {worker_id} exited ({_describe_exit(proc)}) with no episode in flight"
                     )
-                continue
+                else:
+                    logging.error(
+                        f"Worker {worker_id} died ({_describe_exit(proc)}) while running episode {orphan}"
+                    )
+                    _requeue(orphan, f"worker {worker_id} died ({_describe_exit(proc)})")
+                if pending and _spawn(worker_id):
+                    _assign(worker_id)
 
-            if success is None:
-                raise RuntimeError(f"Episode {episode_idx} failed in a worker: {length}")
-
-            successes.append(bool(success))
-            pbar.update(1)
-            if results_file is not None:
-                seed = args.seed + episode_idx if args.seed is not None else -1
-                results_file.write(f"{episode_idx}\t{seed}\t{int(bool(success))}\t{length}\n")
-                results_file.flush()
+            # 3. No process left that could make progress: report what did finish
+            #    instead of throwing the whole run away. A hard crash loop that
+            #    exhausts the restart budgets ends up here.
+            if not live:
+                if not completed:
+                    raise RuntimeError(
+                        f"All {n_workers} worker(s) died before completing a single episode - see the "
+                        f"exit codes logged above (a dead offscreen renderer or an unreachable policy "
+                        f"server is the usual cause)."
+                    )
+                while pending:
+                    _abandon(pending.popleft(), "no worker left to run it")
     finally:
         pbar.close()
         if results_file is not None:
             results_file.close()
-        for worker in workers:
-            worker.terminate()
-        for worker in workers:
-            worker.join()
+        for proc in live.values():
+            proc.terminate()
+        for proc in live.values():
+            proc.join()
 
-    n_done = len(successes)
-    n_success = int(sum(successes))
+    n_done = len(completed) + len(abandoned)
+    n_success = sum(1 for success, _ in completed.values() if success)
     logging.info(f"Total episodes: {n_done}")
-    logging.info(
-        f"Total success rate: {n_success / n_done * 100:.1f}% ({n_success}/{n_done})"
-    )
+    logging.info(f"Total success rate: {n_success / n_done * 100:.1f}% ({n_success}/{n_done})")
+    if abandoned:
+        logging.error(
+            f"{len(abandoned)} episode(s) were abandoned and counted as failures: {sorted(abandoned)} "
+            f"(lower --num_envs if this keeps happening)"
+        )
 
 
 if __name__ == "__main__":
