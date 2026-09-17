@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -227,7 +228,30 @@ ALL_VARIANTS = (
     "stale_image",
     "blank_prompt",
     "zero_state",
+    # Extra proprioception probes (added 2026-09-16). ``zero_state`` alone cannot separate
+    # "the state carries no information" from "this particular constant happens to be
+    # harmless", so these three ask the same question three different ways:
+    #   state_low / state_high : the state is set to the checkpoint's own raw q01 / q99, i.e.
+    #       the extreme-but-real joint configuration the data contains (the same values the
+    #       quantile normalizer pins to -1 / +1).
+    #   swap_state : the state of ANOTHER episode of the SAME task (real marginal, wrong
+    #       frame) - the direct analogue of ``swap_other_episode`` for proprioception.
+    #   state_other_norm : identical raw state, re-encoded with the OTHER normalizer
+    #       (quantile <-> z-score). Destroys no information, so any action movement is pure
+    #       "the model reads the state" evidence.
+    "state_low",
+    "state_high",
+    "swap_state",
+    "state_other_norm",
 )
+
+# How a normalizer is applied to the raw ``state`` / ``actions`` blocks. ``use_quantiles``
+# matches ``DataConfig.use_quantile_norm``, which pi05 configs set to True, so the quantile
+# mapping is what both training (``data_loader.py``) and serving
+# (``policy_config.create_trained_policy``) actually use. The two mappings are NOT
+# interchangeable: quantile pins q01/q99 to -1/+1, z-score divides by std, so the same raw
+# state becomes a different number -- and a different prompt token -- under each.
+NORM_STATS_PARTS = ("both", "state", "actions")
 
 # Synthetic reference row in the error panel: what the error would be if the model simply
 # predicted the training mean (zero in normalized space). An absolute error figure is only
@@ -278,6 +302,23 @@ class Args:
     # to the prompt. Check what the checkpoint expects by looking for the padding identity
     # (mean 0, std 1) in its ``assets/norm_stats.json`` state statistics.
     state_dim_limit: int | None = None
+
+    # Which normalizer to apply to the state / action blocks: "auto" follows
+    # ``DataConfig.use_quantile_norm`` (True for every pi05 config, and what training and
+    # serving use), "yes"/"no" force quantile / z-score. Only "auto" makes the ablation see
+    # the same numbers the policy does; "no" reproduces runs measured before this flag
+    # existed (they were silently z-score).
+    use_quantiles: str = "auto"
+    # Serve the checkpoint with the norm statistics in this file (or a directory holding
+    # ``norm_stats.json``) instead of the ones persisted next to its weights. Answers "how
+    # much does the verdict depend on WHICH statistics the checkpoint is loaded with?" --
+    # e.g. stats recomputed from the data dirs, whose index table can differ from the one the
+    # run was trained with.
+    norm_stats_from: str | None = None
+    # Which blocks of ``--norm-stats-from`` to adopt: "both" replaces the state and the
+    # action statistics (a foreign encoder AND decoder), "state" keeps the checkpoint's own
+    # action mapping so the error scale stays comparable, "actions" does the reverse.
+    norm_stats_parts: str = "both"
 
     # Where figures and JSON summaries are written.
     output_dir: str = "diagnostics/vision"
@@ -350,6 +391,14 @@ class Args:
 
     def __post_init__(self) -> None:
         state_key_slices(self.zero_state_keys)  # raises on unknown keys
+        if self.use_quantiles not in ("auto", "yes", "no"):
+            raise ValueError(f"--use-quantiles must be auto/yes/no, got {self.use_quantiles!r}")
+        if self.norm_stats_parts not in NORM_STATS_PARTS:
+            raise ValueError(
+                f"--norm-stats-parts must be one of {list(NORM_STATS_PARTS)}, got {self.norm_stats_parts!r}"
+            )
+        if self.norm_stats_from is None and self.norm_stats_parts != "both":
+            raise ValueError("--norm-stats-parts only applies together with --norm-stats-from")
         if self.batch_size < 0:
             raise ValueError(f"--batch-size must be >= 0, where 0 means auto; got {self.batch_size}")
         if self.state_dim_limit is not None and not 1 <= self.state_dim_limit <= STATE_DIM:
@@ -659,6 +708,10 @@ def collect_samples(args: Args, horizon: int) -> list[SamplePoint]:
                     "stale_image": build_raw_obs(
                         dataset, ep, step, images_at(dataset, ep, stale_step), prompt
                     ),
+                    # ``swap_state`` isolates the proprioceptive content: this frame's images
+                    # and prompt, but the state of the other episode at the same relative
+                    # progress - a real state, just not this frame's.
+                    "swap_state": build_raw_obs(dataset, swap_ep, swap_step, images, prompt),
                 }
                 samples.append(
                     SamplePoint(
@@ -792,6 +845,38 @@ def dump_samples(samples: Sequence[SamplePoint], path: str, args: Args) -> None:
     logger.info("dumped %d frames to %s (%.1f MiB)", len(samples), out.resolve(), out.stat().st_size / 2**20)
 
 
+def state_swap_partner_indices(samples: Sequence[SamplePoint]) -> list[int]:
+    """For every frame, a frame index from the SAME task but a DIFFERENT episode.
+
+    The proprioceptive analogue of ``swap_other_episode``: the replacement is a real state of
+    the same task, so its marginal distribution is unchanged and only the frame-specific
+    content is destroyed. Frames are grouped into episode blocks in the order they appear in
+    the archive and each block takes its partner from the next block (cyclically), which keeps
+    the relative progress inside the episode roughly matched.
+    """
+    by_task: dict[str, list[int]] = collections.defaultdict(list)
+    for i, sample in enumerate(samples):
+        by_task[sample.task].append(i)
+    partner = list(range(len(samples)))
+    for task, indices in by_task.items():
+        blocks: list[list[int]] = []
+        for i in indices:
+            if not blocks or samples[blocks[-1][-1]].episode != samples[i].episode:
+                blocks.append([])
+            blocks[-1].append(i)
+        if len(blocks) < 2:
+            logger.warning(
+                "task %s holds a single episode in this archive; swap_state cannot change its state",
+                task,
+            )
+            continue
+        for b, block in enumerate(blocks):
+            other = blocks[(b + 1) % len(blocks)]
+            for k, i in enumerate(block):
+                partner[i] = other[k % len(other)]
+    return partner
+
+
 def load_samples(path: str, keep_tasks: Sequence[str] = ()) -> list[SamplePoint]:
     """Rebuild ``SamplePoint``s from an archive written by ``--dump-frames``."""
     with np.load(path, allow_pickle=False) as archive:
@@ -830,6 +915,12 @@ def load_samples(path: str, keep_tasks: Sequence[str] = ()) -> list[SamplePoint]
                 )
             )
     # ``tasks`` above is the archive's own column, hence the different parameter name.
+    partner = state_swap_partner_indices(samples)
+    for i, sample in enumerate(samples):
+        sample.variant_obs["swap_state"] = {
+            **sample.obs,
+            "observation/state": samples[partner[i]].obs["observation/state"],
+        }
     wanted = {str(task) for task in np.ravel(np.asarray(keep_tasks, dtype=object))}
     if wanted:
         kept = [s for s in samples if s.task in wanted]
@@ -866,6 +957,12 @@ class VariantTransform(_transforms.DataTransformFn):
     variant: str = "baseline"
     occlusion: tuple[int, int, int] | None = None
     occlusion_slots: tuple[str, ...] = ()
+    # Normalized images of the raw mean / q01 / q99 of the state block, under the ACTIVE
+    # normalizer (see ``norm_probe_constants``). Used by ``state_low`` / ``state_high``.
+    state_probes: dict[str, np.ndarray] = dataclasses.field(default_factory=dict)
+    # normalized -> raw and raw -> the OTHER normalizer, for ``state_other_norm``.
+    state_decode: Any | None = None
+    state_encode_other: Any | None = None
 
     def __call__(self, data: dict) -> dict:
         if self.occlusion is not None:
@@ -879,9 +976,32 @@ class VariantTransform(_transforms.DataTransformFn):
                 self._mask(data, ("left_wrist_0_rgb",))
             case "zero_state":
                 data["state"] = np.zeros_like(data["state"])
+            case "state_low" | "state_high":
+                data["state"] = self._probe(data, self.variant.removeprefix("state_"))
+            case "state_other_norm":
+                if self.state_decode is None or self.state_encode_other is None:
+                    raise ValueError(
+                        "variant 'state_other_norm' needs q01/q99 in the norm stats of the "
+                        "checkpoint (or of --norm-stats-from)"
+                    )
+                raw = self.state_decode(np.asarray(data["state"], dtype=np.float32))
+                data["state"] = np.asarray(self.state_encode_other(raw), dtype=data["state"].dtype)
             case _:
                 pass
         return data
+
+    def _probe(self, data: dict, name: str) -> np.ndarray:
+        """The constant state vector for ``name`` (``low`` = q01, ``high`` = q99)."""
+        probe = self.state_probes.get(name)
+        if probe is None:
+            raise ValueError(
+                f"variant 'state_{name}' needs q01/q99 in the norm stats of the checkpoint "
+                "(or of --norm-stats-from); they are missing"
+            )
+        # ``Normalize`` slices the statistics to the state it is given, so a probe has to be
+        # sliced the same way or a truncated state (``--state-dim-limit``) would be padded.
+        probe = np.asarray(probe, dtype=np.float32)[: data["state"].shape[-1]]
+        return np.broadcast_to(probe, data["state"].shape).copy()
 
     def _occlude(self, data: dict, row: int, col: int, grid: int) -> None:
         for slot in self.occlusion_slots:
@@ -906,6 +1026,7 @@ def make_input_transform(
     variant: str,
     occlusion: tuple[int, int, int] | None = None,
     occlusion_slots: Sequence[str] | None = None,
+    use_quantiles: bool = False,
 ):
     """Rebuilds the input transform ``Policy`` uses, with an ablation hook inserted.
 
@@ -914,6 +1035,10 @@ def make_input_transform(
     ``InterpolatedStateNoise`` are injected by the data loader (see
     ``training/data_loader.py``), never by the policy, so inference is unaffected by
     ``prompt_drop_p`` / ``state_noise`` in the config.
+
+    ``use_quantiles`` has to match ``DataConfig.use_quantile_norm``, exactly as
+    ``create_trained_policy`` and the data loader do: otherwise the model is fed a state (and
+    scored against a ground truth) encoded with the wrong mapping.
     """
     slots = tuple(CAMERA_VIEWS) if occlusion_slots is None else tuple(occlusion_slots)
     return _transforms.compose(
@@ -921,22 +1046,96 @@ def make_input_transform(
             *data_config.repack_transforms.inputs,
             _transforms.InjectDefaultPrompt(None),
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats),
-            VariantTransform(variant, occlusion=occlusion, occlusion_slots=slots),
+            _transforms.Normalize(norm_stats, use_quantiles=use_quantiles),
+            VariantTransform(
+                variant,
+                occlusion=occlusion,
+                occlusion_slots=slots,
+                state_probes=norm_probe_constants(norm_stats, "state", use_quantiles),
+                state_decode=norm_decoder(norm_stats, "state", use_quantiles),
+                state_encode_other=norm_encoder(norm_stats, "state", not use_quantiles),
+            ),
             *data_config.model_transforms.inputs,
         ]
     )
 
 
-def make_output_transform(data_config: _config.DataConfig, norm_stats):
+def make_output_transform(data_config: _config.DataConfig, norm_stats, use_quantiles: bool = False):
     return _transforms.compose(
         [
             *data_config.model_transforms.outputs,
-            _transforms.Unnormalize(norm_stats),
+            _transforms.Unnormalize(norm_stats, use_quantiles=use_quantiles),
             *data_config.data_transforms.outputs,
             *data_config.repack_transforms.outputs,
         ]
     )
+
+
+def _stats_block(norm_stats, key: str):
+    """The ``NormStats`` of one block, or ``None`` when it (or the stats) is missing."""
+    if norm_stats is None or key not in norm_stats:
+        return None
+    stats = norm_stats[key]
+    if stats.q01 is None or stats.q99 is None:
+        return None
+    return stats
+
+
+def norm_encoder(norm_stats, key: str, use_quantiles: bool):
+    """raw -> normalized under the requested mapping (``None`` when the stats are missing)."""
+    stats = _stats_block(norm_stats, key)
+    if stats is None:
+        return None
+    mean = np.asarray(stats.mean, dtype=np.float32)
+    std = np.asarray(stats.std, dtype=np.float32)
+    q01 = np.asarray(stats.q01, dtype=np.float32)
+    q99 = np.asarray(stats.q99, dtype=np.float32)
+
+    def encode(raw: np.ndarray) -> np.ndarray:
+        n = raw.shape[-1]
+        if use_quantiles:
+            return (raw - q01[:n]) / (q99[:n] - q01[:n] + 1e-6) * 2.0 - 1.0
+        return (raw - mean[:n]) / (std[:n] + 1e-6)
+
+    return encode
+
+
+def norm_decoder(norm_stats, key: str, use_quantiles: bool):
+    """normalized -> raw, the inverse of ``norm_encoder`` with the same mapping."""
+    stats = _stats_block(norm_stats, key)
+    if stats is None:
+        return None
+    mean = np.asarray(stats.mean, dtype=np.float32)
+    std = np.asarray(stats.std, dtype=np.float32)
+    q01 = np.asarray(stats.q01, dtype=np.float32)
+    q99 = np.asarray(stats.q99, dtype=np.float32)
+
+    def decode(value: np.ndarray) -> np.ndarray:
+        n = value.shape[-1]
+        if use_quantiles:
+            return (value + 1.0) / 2.0 * (q99[:n] - q01[:n]) + q01[:n]
+        return value * (std[:n] + 1e-6) + mean[:n]
+
+    return decode
+
+
+def norm_probe_constants(norm_stats, key: str, use_quantiles: bool) -> dict[str, np.ndarray]:
+    """The normalized image of the raw mean / q01 / q99 of a block.
+
+    Defined in raw units because a probe has to mean the same thing whatever the active
+    mapping is: "the mean state" is a raw value, and quantile normalization puts it at
+    ``(mean - q01) / (q99 - q01) * 2 - 1`` rather than at 0 (z-score does put it at 0, which
+    is why ``zero_state`` only coincided with the mean in the historical z-score runs).
+    """
+    stats = _stats_block(norm_stats, key)
+    if stats is None:
+        return {}
+    mean = np.asarray(stats.mean, dtype=np.float32)
+    encode = norm_encoder(norm_stats, key, use_quantiles)
+    probes = {"mean": encode(mean)}
+    for name, quantile in (("low", stats.q01), ("high", stats.q99)):
+        probes[name] = encode(np.asarray(quantile, dtype=np.float32))
+    return probes
 
 
 def to_batch(transformed: Sequence[dict]) -> dict:
@@ -956,6 +1155,101 @@ class LoadedModel:
     model: Any
     data_config: _config.DataConfig
     norm_stats: Any | None
+    # Whether state/actions are normalized with quantiles. Taken from the data config, so it
+    # matches training and serving, and recorded in every JSON this script writes.
+    use_quantiles: bool = False
+
+
+def resolve_use_quantiles(choice: str, data_config: _config.DataConfig, label: str) -> bool:
+    """The normalizer to use, and a loud note when it is not the one the config implies."""
+    configured = bool(getattr(data_config, "use_quantile_norm", False))
+    if choice == "auto":
+        return configured
+    forced = choice == "yes"
+    if forced != configured:
+        logger.warning(
+            "[%s] forcing use_quantiles=%s while the data config says %s: the model is being "
+            "fed inputs (and scored against targets) encoded differently from training",
+            label,
+            forced,
+            configured,
+        )
+    return forced
+
+
+def apply_norm_stats_override(loaded: LoadedModel, source: str, parts: str) -> dict[str, Any]:
+    """Replace the checkpoint's own statistics with those from ``source``.
+
+    ``parts`` selects the blocks: ``both`` swaps the state AND the action statistics (a
+    foreign encoder and decoder at once), ``state`` keeps the checkpoint's own action mapping
+    so the offline error stays on its original scale, ``actions`` does the reverse. The point
+    is to separate "the ablation is sensitive to the numbers in the prompt" from "the
+    numbers in the prompt are the ones the checkpoint was trained with".
+    """
+    path = pathlib.Path(source).expanduser()
+    if path.is_dir():
+        path = path / "norm_stats.json"
+    if not path.exists():
+        raise FileNotFoundError(f"--norm-stats-from {source!r}: {path} does not exist")
+    replacement = _normalize.load(path.parent)
+    base = loaded.norm_stats or {}
+    wanted = None if parts == "both" else (parts,)
+    report: dict[str, Any] = {
+        "source": str(path),
+        "source_sha256": _file_sha256(path),
+        "parts": parts,
+        "blocks": {},
+    }
+    merged = dict(base)
+    for key, stats in replacement.items():
+        if wanted is not None and key not in wanted:
+            continue
+        merged[key] = stats
+        report["blocks"][key] = _diff_norm_stats(base.get(key), stats)
+    for key in ("state", "actions"):
+        if (wanted is None or key in wanted) and key not in replacement:
+            logger.warning("replacement stats have no %r block; keeping the checkpoint's", key)
+            report["blocks"].setdefault(key, {"missing_in_source": True})
+    if not report["blocks"]:
+        raise ValueError(f"nothing to replace: --norm-stats-parts {parts!r} selected no block")
+    loaded.norm_stats = merged
+    logger.info(
+        "[%s] norm stats replaced from %s (parts=%s): %s",
+        loaded.label,
+        path,
+        parts,
+        json.dumps(report["blocks"], indent=2),
+    )
+    return report
+
+
+def _file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _diff_norm_stats(before, after) -> dict[str, Any]:
+    """Per-field max |difference| between two ``NormStats``, plus the dims that moved."""
+    if before is None:
+        return {"replaced_from_none": True}
+    out: dict[str, Any] = {}
+    for field in ("mean", "std", "q01", "q99"):
+        old = getattr(before, field, None)
+        new = getattr(after, field, None)
+        if old is None or new is None:
+            out[field] = None
+            continue
+        old, new = np.asarray(old, dtype=np.float64), np.asarray(new, dtype=np.float64)
+        n = min(old.shape[-1], new.shape[-1])
+        delta = np.abs(old[:n] - new[:n])
+        out[field] = {
+            "max_abs_diff": float(delta.max()),
+            "dims_differing": np.flatnonzero(delta > 1e-6).tolist(),
+        }
+    return out
 
 
 def _data_config_for(config: _config.TrainConfig) -> _config.DataConfig:
@@ -986,7 +1280,11 @@ def resolve_checkpoint_dir(checkpoint_dir: str) -> pathlib.Path:
 
 
 def load_model(
-    checkpoint_dir: str, config_name: str, label: str, action_horizon: int | None = None
+    checkpoint_dir: str,
+    config_name: str,
+    label: str,
+    action_horizon: int | None = None,
+    use_quantiles: str = "auto",
 ) -> LoadedModel:
     train_config = _config.get_config(config_name)
     if action_horizon is not None and int(train_config.model.action_horizon) != int(action_horizon):
@@ -1033,13 +1331,23 @@ def load_model(
     else:
         logger.warning("[%s] no assets/ directory; normalization will be a no-op", label)
 
+    data_config = _data_config_for(train_config)
+    quantiles = resolve_use_quantiles(use_quantiles, data_config, label)
+    logger.info(
+        "[%s] normalizer: %s (data config says use_quantile_norm=%s)",
+        label,
+        "quantile" if quantiles else "z-score",
+        getattr(data_config, "use_quantile_norm", None),
+    )
+
     return LoadedModel(
         label=label,
         checkpoint_dir=ckpt,
         config=train_config,
         model=model,
-        data_config=_data_config_for(train_config),
+        data_config=data_config,
         norm_stats=norm_stats,
+        use_quantiles=quantiles,
     )
 
 
@@ -1074,11 +1382,20 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
     sample_actions = nnx_utils.module_jit(loaded.model.sample_actions)
     rng = jax.random.key(args.seed)
 
+    if "swap_state" in args.variants and any("swap_state" not in s.variant_obs for s in samples):
+        raise ValueError(
+            "variant 'swap_state' needs a partner state for every frame; this run has none. "
+            "Falling back to the unmodified observation would report a delta of 0, i.e. look "
+            "exactly like 'the model ignores its state'."
+        )
+
     transforms = {
-        variant: make_input_transform(loaded.data_config, loaded.norm_stats, variant)
+        variant: make_input_transform(
+            loaded.data_config, loaded.norm_stats, variant, use_quantiles=loaded.use_quantiles
+        )
         for variant in args.variants
     }
-    output_transform = make_output_transform(loaded.data_config, loaded.norm_stats)
+    output_transform = make_output_transform(loaded.data_config, loaded.norm_stats, loaded.use_quantiles)
     noise = np.stack([noise_for(s.key, horizon, action_dim, args.seed) for s in samples])
 
     if loaded.norm_stats is not None:
@@ -1088,22 +1405,34 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
         action_mean = np.zeros(action_dim, dtype=np.float32)
         action_std = np.ones(action_dim, dtype=np.float32)
 
-    # Dimensions whose normalization std is zero carry no signal at all: robocasa's fixed
-    # robot base has `base_motion` and `control_mode` identically zero in every dataset, so
-    # the normalizer maps them to 0/(0 + 1e-6) = 0. Comparing the model's raw output for
-    # those dims against 0 in normalized space is meaningless (any output maps back to ~0 in
-    # physical units), and including them would dominate the aggregate error.
-    informative = action_std[:N_ENV_ACTION_DIM] > 1e-6
+    encode_actions = norm_encoder(loaded.norm_stats, "actions", loaded.use_quantiles)
+    if encode_actions is None:
+        # No stats at all: normalization is a no-op, so the "normalized" target is the raw one.
+        encode_actions = lambda raw: np.asarray(raw, dtype=np.float32)  # noqa: E731
+
+    # Dimensions whose normalizer is degenerate carry no signal at all: robocasa's fixed robot
+    # base has `base_motion` and `control_mode` identically zero in every dataset, so both
+    # mappings map them to a constant (0 under z-score, which divides by std = 0; q01 == q99
+    # under quantiles). Comparing the model's output for those dims against that constant is
+    # meaningless, and including them would dominate the aggregate error. Under quantile
+    # normalization the degeneracy test has to be on the q01..q99 RANGE, not on the std.
+    if loaded.use_quantiles and loaded.norm_stats is not None and "actions" in loaded.norm_stats:
+        stats = loaded.norm_stats["actions"]
+        if stats.q01 is not None and stats.q99 is not None:
+            q01 = np.asarray(stats.q01)
+            q99 = np.asarray(stats.q99)
+            informative = (q99[:N_ENV_ACTION_DIM] - q01[:N_ENV_ACTION_DIM]) > 1e-6
+        else:
+            informative = action_std[:N_ENV_ACTION_DIM] > 1e-6
+    else:
+        informative = action_std[:N_ENV_ACTION_DIM] > 1e-6
     excluded_dims = np.flatnonzero(~informative).tolist()
 
-    n_gt = samples[0].gt_chunk.shape[-1]
-    gt_norm = np.stack(
-        [
-            (s.gt_chunk - action_mean[: s.gt_chunk.shape[-1]])
-            / (action_std[: s.gt_chunk.shape[-1]] + 1e-6)
-            for s in samples
-        ]
-    )
+    # The ground truth has to live in the SAME space as the model's output, otherwise the
+    # error compares a quantile-normalized prediction against a z-score-normalized target and
+    # no model can score better than that mismatch allows.
+    gt_norm = np.stack([encode_actions(s.gt_chunk) for s in samples])
+    n_gt = gt_norm.shape[-1]
     # The model's chunk can be longer than the recorded ground truth: a checkpoint trained at
     # horizon 50 is often scored against frames dumped at horizon 20. Score only the steps the
     # two have in common, so the error stays comparable across horizons.
@@ -1187,7 +1516,9 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
 
     # What the error would be for a model that always predicts the training mean. High
     # absolute errors have to be read against this: "error 0.55" means very different things
-    # depending on whether the trivial predictor scores 0.61 or 0.20.
+    # depending on whether the trivial predictor scores 0.61 or 0.20. The reference is always
+    # "predict 0 in the ACTIVE normalized space" - that is the sample mean under z-score, and
+    # the centre of the q01..q99 range under quantile normalization.
     mean_err_norm = np.abs(gt_norm).mean(axis=(0, 1))
     results[PREDICT_MEAN_KEY] = {
         "delta_phys_per_dim": [0.0] * len(spread),
@@ -1211,6 +1542,13 @@ def run_ablation(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint]
         "zero_state_keys": list(args.zero_state_keys),
         "tasks_scored": sorted({s.task for s in samples}),
         "num_steps": args.num_steps,
+        "use_quantiles": bool(loaded.use_quantiles),
+        "predict_mean_reference_space": (
+            "0 in the active normalized space (z-score: the sample mean; quantile: the centre "
+            "of the q01..q99 range)"
+        ),
+        "norm_stats_parts": args.norm_stats_parts if args.norm_stats_from else None,
+        "norm_stats_from": args.norm_stats_from,
         "scored_action_dims": np.flatnonzero(informative).tolist(),
         "excluded_action_dims": excluded_dims,
         "excluded_action_dims_reason": (
@@ -1241,6 +1579,12 @@ def ablation_verdict(results: dict[str, Any]) -> dict[str, Any]:
         ("temporal_alignment", "stale_image"),
         ("language", "blank_prompt"),
         ("proprioception", "zero_state"),
+        # Extra proprioception probes: how the state behaves when it is not zeroed but the
+        # info is still wrong (another episode) or merely re-encoded (other normalizer).
+        ("proprioception_swap", "swap_state"),
+        ("proprioception_q01", "state_low"),
+        ("proprioception_q99", "state_high"),
+        ("state_encoding", "state_other_norm"),
     )
     reliance = {k: results[v]["delta_phys_over_spread"] for k, v in pairs if v in results}
     verdict: dict[str, Any] = {"reliance_over_baseline_spread": reliance}
@@ -1313,6 +1657,35 @@ def ablation_verdict(results: dict[str, Any]) -> dict[str, Any]:
                 "The policy reacts to the presence of an image but barely reacts to *which* scene "
                 "it is, so the visual content is largely being ignored."
             )
+
+    probes = {
+        "zero": reliance.get("proprioception"),
+        "swap": reliance.get("proprioception_swap"),
+        "q01": reliance.get("proprioception_q01"),
+        "q99": reliance.get("proprioception_q99"),
+        "encoding": reliance.get("state_encoding"),
+    }
+    present = {k: v for k, v in probes.items() if v is not None}
+    if len(present) > 1:
+        verdict["state_probes"] = present
+        zero, swap, encoding = probes["zero"], probes["swap"], probes["encoding"]
+        if None not in (zero, swap, encoding) and zero < 0.08:
+            if max(swap, encoding) < 0.08:
+                verdict["proprioception_detail"] = (
+                    "Every proprioception probe agrees (zeroed state, another episode's state "
+                    f"and the same state under the other normalizer move the action by "
+                    f"{zero:.3f}/{swap:.3f}/{encoding:.3f} of the GT spread), so the state "
+                    "really is ignored - the small zero_state delta is not an artefact of the "
+                    "constant that happened to be used."
+                )
+            else:
+                verdict["proprioception_detail"] = (
+                    f"Read State={zero:.3f} with care: the state's VALUE barely matters "
+                    f"(zeroed {zero:.3f}, another episode's state {swap:.3f}) while its ENCODING "
+                    f"moves the action by {encoding:.3f}. The model reacts to the numbers in the "
+                    "prompt rather than to what they mean, which is OOD sensitivity, not "
+                    "proprioception."
+                )
     return verdict
 
 
@@ -1353,11 +1726,18 @@ def run_occlusion(args: Args, loaded: LoadedModel, samples: Sequence[SamplePoint
     sample_actions = nnx_utils.module_jit(loaded.model.sample_actions)
     rng = jax.random.key(args.seed)
 
-    output_transform = make_output_transform(loaded.data_config, loaded.norm_stats)
-    base_transform = make_input_transform(loaded.data_config, loaded.norm_stats, "baseline")
+    output_transform = make_output_transform(loaded.data_config, loaded.norm_stats, loaded.use_quantiles)
+    base_transform = make_input_transform(
+        loaded.data_config, loaded.norm_stats, "baseline", use_quantiles=loaded.use_quantiles
+    )
     cell_transforms = {
         (row, col): make_input_transform(
-            loaded.data_config, loaded.norm_stats, "baseline", occlusion=(row, col, grid), occlusion_slots=slots
+            loaded.data_config,
+            loaded.norm_stats,
+            "baseline",
+            occlusion=(row, col, grid),
+            occlusion_slots=slots,
+            use_quantiles=loaded.use_quantiles,
         )
         for row in range(grid)
         for col in range(grid)
@@ -1710,7 +2090,9 @@ def knn_probe_r2(
 def run_features(args: Args, models: Sequence[LoadedModel], samples: Sequence[SamplePoint]) -> dict[str, Any]:
     layers = list(args.feature_layers)
     # Build the model input once and reuse it for every checkpoint so the comparison is exact.
-    transform = make_input_transform(models[0].data_config, models[0].norm_stats, "baseline")
+    transform = make_input_transform(
+        models[0].data_config, models[0].norm_stats, "baseline", use_quantiles=models[0].use_quantiles
+    )
     chunks = []
     for start in range(0, len(samples), args.batch_size):
         batch = to_batch([transform(s.obs) for s in samples[start : start + args.batch_size]])
@@ -1901,7 +2283,12 @@ def main(args: Args) -> None:
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    loaded = load_model(args.checkpoint_dir, args.config_name, "finetuned", args.action_horizon)
+    loaded = load_model(
+        args.checkpoint_dir, args.config_name, "finetuned", args.action_horizon, args.use_quantiles
+    )
+    norm_stats_report = None
+    if args.norm_stats_from:
+        norm_stats_report = apply_norm_stats_override(loaded, args.norm_stats_from, args.norm_stats_parts)
     horizon = loaded.config.model.action_horizon
     if args.batch_size <= 0:
         args.batch_size = auto_batch_size(horizon)
@@ -1914,6 +2301,7 @@ def main(args: Args) -> None:
                 args.compare_config_name or args.config_name,
                 args.compare_label,
                 args.action_horizon,
+                args.use_quantiles,
             )
         )
 
@@ -1943,6 +2331,11 @@ def main(args: Args) -> None:
         "action_horizon": horizon,
         "zero_state_keys": list(args.zero_state_keys),
         "state_dim_limit": args.state_dim_limit,
+        "use_quantiles": bool(loaded.use_quantiles),
+        "norm_stats_from": args.norm_stats_from,
+        "norm_stats_parts": args.norm_stats_parts if args.norm_stats_from else None,
+        "norm_stats_source_sha256": (norm_stats_report or {}).get("source_sha256"),
+        "norm_stats_report": norm_stats_report,
         "batch_size": args.batch_size,
         "frames_tasks": list(args.frames_tasks),
         "tasks": sorted({s.task for s in samples}),

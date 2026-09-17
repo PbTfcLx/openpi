@@ -135,6 +135,15 @@ def load(directory: pathlib.Path, gt: tuple[np.ndarray, np.ndarray] | None, args
         "action_horizon": ablation.get("action_horizon"),
         "zero_state_keys": ",".join(ablation.get("zero_state_keys") or []) or "-",
         "tasks": len(ablation.get("tasks_scored") or []) or None,
+        # ``Q`` = quantile normalization (what training and serving use for pi05), ``z`` =
+        # z-score. Rows measured under different mappings are NOT on the same scale: the
+        # deltas come out of the unnormalizer, and the two mappings differ by a per-dimension
+        # factor (std vs half the q01..q99 range). A missing key means the run predates the
+        # flag, i.e. it was silently z-score.
+        "norm": "Q" if ablation.get("use_quantiles") else "z",
+        # Which norm stats the run loaded: "own" = the checkpoint's persisted file, otherwise
+        # the blocks taken from --norm-stats-from.
+        "stats": ablation.get("norm_stats_parts") or "own",
         "err_vs_mean": ablation["verdict"].get("baseline_error_vs_predict_mean"),
     }
     for name, column in DELTA_VARIANTS:
@@ -194,7 +203,7 @@ def main(args: Args) -> None:
 
     unit = "gt" if gt is not None else "own"
     header = (
-        f"{'checkpoint':<38} {'ah':>3} {'fr':>4} {'zj':>3} "
+        f"{'checkpoint':<38} {'ah':>3} {'fr':>4} {'zj':>3} {'nrm':>3} {'sta':>5} "
         f"{'Vision':>6} {'State':>6} {'Lang':>6} {'Scene':>6} | "
         f"{'imgEr':>5} {'stEr':>5} {'langEr':>6} {'sceneEr':>7} | "
         f"{'err/mn':>6} {'min(V,S)':>8}  verdict"
@@ -204,6 +213,7 @@ def main(args: Args) -> None:
     for r in records:
         print(
             f"{r['label']:<38} {fmt(r['action_horizon'], '3.0f')} {r['frames']:>4} {r['zero_state_keys']:>3} "
+            f"{r['norm']:>3} {r['stats']:>5} "
             f"{fmt(r['Vision'], '6.3f')} {fmt(r['State'], '6.3f')} "
             f"{fmt(r['Lang'], '6.3f')} {fmt(r['Scene'], '6.3f')} | "
             f"{fmt(r['imgEr'], '5.2f')} {fmt(r['stEr'], '5.2f')} "
@@ -211,9 +221,21 @@ def main(args: Args) -> None:
             f"{fmt(r['err_vs_mean'], '6.3f')} {fmt(r['min_VS'], '8.3f')}  {r['verdict']}"
         )
 
+    mixed = {r["norm"] for r in records}
+    if len(mixed) > 1:
+        print()
+        print(
+            "WARNING: this table mixes normalizers "
+            f"({sorted(mixed)}); the deltas are NOT on the same scale. Rows without a recorded "
+            "normalizer are legacy z-score runs (before 2026-09-16) - re-measure before "
+            "comparing them against Q rows."
+        )
+
     print()
     print(f"Delta units: {'ground-truth action spread of the archived frames' if unit == 'gt' else 'each policy own prediction spread (not cross-comparable)'}.")
     print("  Vision = mask_all_images | State = zero_state | Lang = blank_prompt | Scene = swap_other_episode")
+    print("  nrm    = normalizer used (Q = quantile, the pi05 default; z = z-score, legacy runs)")
+    print("  sta    = norm stats loaded (own = the checkpoint's own; else the blocks replaced)")
     print("  Delta  = mean |change of the predicted action| / ground-truth spread  (0 = input ignored)")
     print("  *Er    = offline action error relative to the unmodified baseline (1.00 = not needed to fit)")
     print(f"  min(V,S) high  <=> the policy needs both image and proprioception (the property to optimise)")
@@ -226,7 +248,7 @@ def main(args: Args) -> None:
         path = pathlib.Path(args.csv_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [
-            "label", "action_horizon", "frames", "zero_state_keys", "tasks",
+            "label", "action_horizon", "frames", "zero_state_keys", "tasks", "norm", "stats",
             "Vision", "State", "Lang", "Scene", "imgEr", "stEr", "langEr", "sceneEr",
             "err_vs_mean", "min_VS", "verdict", "path",
         ]
