@@ -16,7 +16,7 @@ inference config, runs the eval, aggregates success rates, and records them.
 | checkpoint | `checkpoints/pi05_robocasa_state_noise/test_state_noise/18000` (step dir, or the exp dir to auto-pick the latest step) | yes |
 | tasks | `OpenDrawer,CloseDrawer,OpenDoubleDoor,CloseDoubleDoor,CoffeeSetupMug,TurnOnStove` | yes |
 | training config | `pi05_robocasa_state_noise` | optional — inferred from `checkpoints/<config>/<exp>/<step>` |
-| scale overrides | `--num-trials`, `--num-envs`, `--seed`, `--replan-steps` | optional |
+| scale overrides | `--num-trials`, `--num-envs`, `--seed`, `--replan-steps`, `--max-steps` | optional |
 
 Env id for a task is `robocasa_panda_omron/<Task>_PandaOmron_Env` (141 task classes are registered; the
 6 robocasa tasks used so far are OpenDrawer, CloseDrawer, OpenDoubleDoor, CloseDoubleDoor,
@@ -41,6 +41,24 @@ available memory as `memory.current - inactive_file`. If other jobs are hogging 
 come out as low as 1 env, which makes a 100-trial run drag; check the printed reason and either free
 memory / `screen -X quit` the leftovers, or override explicitly with `--num-envs N` (and `--env-gb` if
 your per-env memory assumption differs, e.g. 4 GB with video vs 2.5 GB with `--no-save-video`).
+
+**Per-task episode budget.** `examples/robocasa/main.py` owns `TASK_MAX_STEPS` and applies it whenever
+`--args.max-steps` is not passed:
+
+| Task | max_steps | | Task | max_steps |
+|---|---|---|---|---|
+| OpenDrawer | 400 | | OpenDoubleDoor | 800 |
+| CloseDrawer | 400 | | CoffeeSetupMug | 500 |
+| TurnOnStove | 400 | | CloseDoubleDoor | 700 |
+
+Anything else falls back to `DEFAULT_MAX_STEPS = 720`. That file is the single source of truth:
+`plan_eval.py` parses the table out of it (via `ast`, no duplicated copy) and stores the resolved budget
+in each task entry, and `run_eval.py` passes **no** `--args.max-steps` unless you pin one value for every
+task with `plan_eval.py --max-steps N`. To change a budget, edit `TASK_MAX_STEPS` in `main.py` — the
+skill picks it up automatically. Task name resolution (`<Task>_<Robot>_Env` → `<Task>`) is done by
+`_task_name_from_env` in `main.py`: longest known `TASK_MAX_STEPS` key first, then the trailing robot
+name out of `GROOT_ROBOCASA_ENVS_ROBOTS` — so robots whose names contain underscores (`Panda_Panda`,
+`GR1FixedLowerBodyFourierHands`) still resolve correctly.
 
 ### 2. Derive the inference (serve) config — the important rule
 
@@ -109,6 +127,46 @@ Always confirm with the user before writing to the shared doc.
 
 If `run_eval.py` started the server, it stops it (`screen -S <name> -X quit`). If you started it
 manually, stop it yourself and say so.
+
+## Batch runs over many checkpoints
+
+`scripts/batch_eval.py` runs the same task(s) over a list of checkpoints. **One policy server per
+checkpoint** (each checkpoint has its own `--policy.dir`, so `serve_policy` must be restarted) — the
+driver builds the plan, makes sure the port is free, runs the eval, and stops the server, per checkpoint.
+
+```bash
+# runs/<batch>/cps.txt: one `<config>/<exp>/<step>` per line (relative to checkpoints/) or a glob
+screen -dmS eval_<batch> bash -lc 'cd <repo> && python3 .github/skills/robocasa-eval/scripts/batch_eval.py \
+  --checkpoints runs/<batch>/cps.txt --tasks OpenDoubleDoor --num-envs 16 --batch-id <batch> --resume \
+  > runs/<batch>/batch.log 2>&1'
+```
+
+Outputs: `runs/<batch>/<config>__<exp>__<step>/{plan.json,plan.log,eval.log,summary.md,summary.json}`
+plus `runs/<batch>/batch_summary.{json,md}`, refreshed after **every** checkpoint — so the job is
+monitorable (`tail -f runs/<batch>/batch.log`) and resumable (`--resume` skips checkpoints that already
+have a non-null success rate; `--force` redoes them). Before each checkpoint it quits any leftover
+`openpi_serve_<port>` session and waits for the port to close, so a stale server from the *previous*
+checkpoint (different weights!) can never be silently reused.
+
+### Progress
+
+`scripts/batch_progress.py` prints which checkpoint is running, how far it is and the ETA. It only reads
+files the batch already writes, so it works on a run that is already in flight:
+
+```bash
+python3 .github/skills/robocasa-eval/scripts/batch_progress.py --batch-dir runs/<batch>          # once
+python3 .github/skills/robocasa-eval/scripts/batch_progress.py --batch-dir runs/<batch> --watch 15 # live
+```
+
+```
+checkpoints [████████░░░░░░░░░░░░░░░░░░░░░░]  8/30 done (27%)   elapsed 3.1h   ETA 8.5h
+▶ now  #9/30  pi05_robocasa/test_action_horizon/15000    cfg=pi05_robocasa
+    OpenDoubleDoor   [█████████░░░░░░░░░░░░░░░░░░░░░░░]  31/100 (31%)   12.4s/ep  ETA 14m   max_steps=850
+```
+
+Episode counts come from the per-episode `results/<task>.tsv` (unique `episode_idx` values), which is
+exact — the harness's tqdm bar is **not** usable from the log (it writes `\r` updates that do not
+survive redirection).
 
 ## Outputs of one run
 

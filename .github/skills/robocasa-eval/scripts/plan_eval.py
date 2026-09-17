@@ -24,6 +24,7 @@ The plan JSON is consumed by `run_eval.py`.
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import json
 import os
@@ -66,6 +67,35 @@ TRAIN_ONLY_DATA_FLAGS = ("state_noise", "prompt_drop_p", "state_noise_beta_a", "
 
 def env_id(task: str) -> str:
     return f"robocasa_panda_omron/{task}_PandaOmron_Env"
+
+
+def read_task_max_steps() -> tuple[dict[str, int], int | None, str]:
+    """Read TASK_MAX_STEPS / DEFAULT_MAX_STEPS out of `examples/robocasa/main.py`.
+
+    The harness owns those numbers (it applies them at run time), so parse them instead of keeping a
+    second copy here that can drift. Returns ``(table, default, source)``.
+    """
+    path = REPO_ROOT / "examples" / "robocasa" / "main.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {}, None, f"unreadable ({e})"
+    table: dict[str, int] = {}
+    default: int | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if node.targets[0].id == "TASK_MAX_STEPS" and isinstance(value, dict):
+            table = {str(k): int(v) for k, v in value.items()}
+        elif node.targets[0].id == "DEFAULT_MAX_STEPS" and isinstance(value, int):
+            default = int(value)
+    if not table:
+        return {}, default, "TASK_MAX_STEPS not found in examples/robocasa/main.py"
+    return table, default, "examples/robocasa/main.py"
 
 
 def parse_tasks(spec: str) -> list[str]:
@@ -258,7 +288,7 @@ def main() -> None:
     ap.add_argument("--env-gb", type=float, default=0.0, help="memory assumed per eval env when deriving num_envs (default 4 with video, 2.5 without)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--replan-steps", type=int, default=5)
-    ap.add_argument("--max-steps", type=int, default=720)
+    ap.add_argument("--max-steps", type=int, default=0, help="0 = per-task budget from examples/robocasa/main.py (TASK_MAX_STEPS); set it to pin one value for every task")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-save-video", action="store_true", help="faster, much lower memory: writes --args.no-save-video")
     ap.add_argument("--robocasa-python", default=os.environ.get("OPENPI_ROBOCASA_PYTHON", str(DEFAULT_ROBOCASA_PYTHON)))
@@ -276,13 +306,24 @@ def main() -> None:
     num_envs, num_envs_why, avail_gb = resources(args.env_gb or None, save_video=not args.no_save_video)
 
     run_dir = REPO_ROOT / "data" / "robocasa" / exp_name / f"checkpoint-{step}"
+    # Per-task episode budgets: the CLI override wins, else the harness table, else "leave it to main.py".
+    task_max_steps, default_max_steps, max_steps_source = read_task_max_steps()
+    if args.max_steps:
+        max_steps_source = f"--max-steps {args.max_steps} (override for every task)"
     task_entries = []
     for t in tasks:
         slug = t.lower()
+        if args.max_steps:
+            budget: int | None = args.max_steps
+        elif task_max_steps:
+            budget = task_max_steps.get(t, default_max_steps or 720)
+        else:
+            budget = None
         task_entries.append(
             {
                 "name": t,
                 "env_name": env_id(t),
+                "max_steps": budget,
                 "video_dir": str((run_dir / "videos" / slug).relative_to(REPO_ROOT)),
                 "results_tsv": str((run_dir / "results" / f"{slug}.tsv").relative_to(REPO_ROOT)),
                 "log": str((run_dir / "logs" / f"{slug}.log").relative_to(REPO_ROOT)),
@@ -305,7 +346,12 @@ def main() -> None:
             "num_envs_reason": f"explicit --num-envs" if args.num_envs else num_envs_why,
             "seed": args.seed,
             "replan_steps": args.replan_steps,
-            "max_steps": args.max_steps,
+            # Only set when the caller pinned one budget for every task; otherwise each task uses its
+            # per-task default and `run_eval.py` passes no --args.max-steps at all.
+            "max_steps_override": args.max_steps or None,
+            "max_steps_source": max_steps_source,
+            "task_max_steps": task_max_steps,
+            "default_max_steps": default_max_steps,
             "save_video": not args.no_save_video,
             "port": args.port,
         },
@@ -343,9 +389,13 @@ def main() -> None:
     print(f"norm stats      : {ns['path']} present={ns['present']} {dims}")
     print(f"eval            : {plan['eval']['num_trials_per_task']} trials x {plan['eval']['num_envs']} envs"
           f", seed={args.seed}, replan={args.replan_steps}, save_video={plan['eval']['save_video']}")
+    print(f"max_steps       : {max_steps_source}")
+    if task_max_steps:
+        shown = {t["name"]: t["max_steps"] for t in task_entries}
+        print(f"                  {shown}  (default for unlisted tasks: {default_max_steps})")
     print(f"  num_envs why  : {plan['eval']['num_envs_reason']}")
     print(f"run dir         : {plan['run_dir']}  (videos/, results/, logs/)")
-    print("tasks           : " + ", ".join(f"{t['name']}" for t in task_entries))
+    print("tasks           : " + ", ".join(f"{t['name']}(max_steps={t['max_steps']})" for t in task_entries))
     print("-" * 78)
     print("serve:")
     print(f"  cd {REPO_ROOT} && screen -dmS openpi_serve_{args.port} bash -lc \\")

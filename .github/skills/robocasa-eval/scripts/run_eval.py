@@ -103,13 +103,14 @@ def build_eval_argv(plan: dict, task: dict) -> list[str]:
         str(ev["seed"]),
         "--args.replan-steps",
         str(ev["replan_steps"]),
-        "--args.max-steps",
-        str(ev["max_steps"]),
         "--args.video-out-path",
         task["video_dir"],
         "--args.results-out-path",
         task["results_tsv"],
     ]
+    if ev.get("max_steps_override"):
+        # One budget pinned for every task; otherwise main.py applies its own per-task TASK_MAX_STEPS.
+        argv += ["--args.max-steps", str(ev["max_steps_override"])]
     if not ev.get("save_video", True):
         argv.append("--args.no-save-video")
     return argv
@@ -125,7 +126,8 @@ def run_task(plan: dict, task: dict) -> dict:
     env["PYTHONPATH"] = str(repo / "packages" / "openpi-client" / "src")
     env.setdefault("OPENPI_EVAL_THREADS", "1")
 
-    print(f"\n{'=' * 78}\n[task] {task['name']}  ({task['env_name']})\n[cmd ] {' '.join(shlex.quote(a) for a in argv)}"
+    print(f"\n{'=' * 78}\n[task] {task['name']}  ({task['env_name']}, max_steps={task.get('max_steps') or 'per-task default'})"
+          f"\n[cmd ] {' '.join(shlex.quote(a) for a in argv)}"
           f"\n[log ] {log_path}\n{'=' * 78}", flush=True)
 
     t0 = time.time()
@@ -158,6 +160,7 @@ def run_task(plan: dict, task: dict) -> dict:
     return {
         "task": task["name"],
         "env_name": task["env_name"],
+        "max_steps": task.get("max_steps"),
         "status": status,
         "exit_code": code,
         "success_rate": rate,
@@ -182,20 +185,29 @@ def write_summary(plan: dict, results: list[dict], out_dir: pathlib.Path) -> tup
         f"- 模型: `{plan['checkpoint_dir']}`",
         f"- 训练 config: `{plan['train_config']}` | 推理 config: `{plan['inference_config']}`",
         f"- 评测参数: {ev['num_trials_per_task']} trials × {ev['num_envs']} envs, seed={ev['seed']}, "
-        f"replan={ev['replan_steps']}, max_steps={ev['max_steps']}, save_video={ev['save_video']}",
+        f"replan={ev['replan_steps']}, save_video={ev['save_video']}",
+        "- max_steps: "
+        + (
+            f"统一 {ev['max_steps_override']}"
+            if ev.get("max_steps_override")
+            else f"按任务预算（来源: {ev.get('max_steps_source', 'main.py')}）"
+        ),
         f"- 时间: {stamp}",
         "",
-        "| Task | Success | Rate |",
-        "|---|---|---|",
+        "| Task | max_steps | Success | Rate |",
+        "|---|---|---|---|",
     ]
     for r in results:
+        ms = r.get("max_steps") or "default"
         if r["success_rate"] is None:
-            lines.append(f"| {r['task']} | – | 失败 (exit {r['exit_code']}) |")
+            lines.append(f"| {r['task']} | {ms} | – | 失败 (exit {r['exit_code']}) |")
         else:
             flag = "" if r["status"] == "ok" else " ⚠️"
-            lines.append(f"| {r['task']} | {r['episodes']}/{plan['eval']['num_trials_per_task']} | {r['success_rate']:.1f}%{flag} |")
+            lines.append(
+                f"| {r['task']} | {ms} | {r['episodes']}/{plan['eval']['num_trials_per_task']} | {r['success_rate']:.1f}%{flag} |"
+            )
     if mean is not None:
-        lines.append(f"| **平均** | {total_ok}/{total_n} | **{mean:.1f}%** |")
+        lines.append(f"| **平均** | – | {total_ok}/{total_n} | **{mean:.1f}%** |")
     lines += ["", f"- 运行目录: `{plan['run_dir']}`", ""]
     md = "\n".join(lines)
 

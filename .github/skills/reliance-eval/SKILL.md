@@ -89,6 +89,10 @@ swap_other_episode, stale_image, blank_prompt, zero_state, predict_mean_referenc
 flow-matching noise is shared by all variants with a fixed seed, so the comparison is paired.
 84 frames x 9 variants takes ~5 min at batch 2.
 
+Do **not** pass `--use-quantiles` unless you are deliberately reproducing a pre-2026-09-16 run:
+`auto` (the default) uses the same mapping as training and serving. See the pitfall below —
+rows measured in the two mappings are not on the same scale.
+
 Choose the input rewriting deliberately:
 
 | Situation | Flag | Why |
@@ -96,6 +100,8 @@ Choose the input rewriting deliberately:
 | Checkpoint trained **without** a key (its stats slot is the padding identity) | `--zero-state-keys joint_position` | sends a constant, matching what the model saw |
 | Same, and you want the **exact** training width | add `--state-dim-limit 16` | `Normalize` slices the stats to the given state length, so 16 dims = 16 stats = 16 prompt numbers, exactly as in training; zeroing alone adds one constant number per dropped slot |
 | Checkpoint trained on fewer tasks than the archive | `--frames-tasks t1 t2 ...` | frames from an unseen task are a trap: the policy must guess the instruction from the image, which inflates `Vision` for the wrong reason |
+| You want to know whether the verdict depends on *which* statistics the checkpoint is served with | `--norm-stats-from <file|dir> [--norm-stats-parts state\|actions\|both]` | serving the checkpoint with recomputed stats changes every number (measured: `stEr` 1.08 -> 0.97). `state` keeps the checkpoint's own action mapping so the error stays on its original scale |
+| You suspect `zero_state` is too weak a probe | add `state_low state_high swap_state state_other_norm` to `--variants` | q01/q99 (the discretizer's extreme bins), another episode's state (in-distribution, wrong content), and the same state under the other normalizer (destroys no information) |
 
 ### 3. Collate
 
@@ -124,11 +130,16 @@ checkpoints, the second to inspect one.
 - **`min(V, S)` is the headline.** Across the 5-task RoboCasa family the two channels trade off
   against each other ($State \approx 0.33 - 0.60\,Vision$, $R^2 \approx 0.6$, Spearman ≈ −0.9):
   every recipe that raises one lowers the other. A row is interesting only if it sits *above*
-  that line, i.e. keeps `State` while `Vision` is high.
+  that line, i.e. keeps `State` while `Vision` is high. **⚠️ That line was fitted on z-score
+  rows and is void** (see pitfall 0); re-fit it only from rows measured after the fix.
+- **Never compare a row measured before 2026-09-16 with one measured after it.** The `nrm`
+  column of `scripts/reliance_table.py` says which mapping produced a row (`Q` = quantile,
+  `z` = legacy z-score); the same checkpoint gives `State` 0.022 (z) vs 0.150 (Q) and
+  `stEr` 1.00 (z) vs 1.08 (Q).
 - **A `State` of ~0.02 with `Vision` ~0.6** is the "pure vision" end (state-noise runs). **A
   `State` of ~0.45 with `Vision` ~0.04** is the original proprioception-only trajectory player.
 - **`langEr` is nearly constant (1.03–1.16) across every checkpoint measured**, so it rarely
-  discriminates; `imgEr` / `stEr` span 1.0–1.6 and do.
+  discriminates; `imgEr` / `stEr` span 1.0–2.4 and do.
 - **`Scene`** (swap in another episode's pixels, same task/state/prompt) is the object-perception
   proxy: 0.002 means "the pixels are wallpaper", 0.2 means the scene content drives the action.
 - Fit quality: `err/mn` ≤ 0.95 means the action head actually fitted the behaviour (> 0.95: the
@@ -137,6 +148,22 @@ checkpoints, the second to inspect one.
   the same command gave `Vision` 0.4878 and 0.4884). Never interpret differences below that.
 
 ## Pitfalls (all of these actually happened)
+
+0. **Normalization mapping (found 2026-09-16 — invalidated every earlier row).** Training
+   (`training/data_loader.py`) and serving (`policy_config.create_trained_policy`) both call
+   `Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm)`, and every pi05 config
+   sets `use_quantile_norm=True`. `diagnose_vision.py` used to hard-code the z-score
+   `Normalize`, so the model was fed a state (and scored against a ground truth) encoded
+   `(x-mean)/std` instead of `(x-q01)/(q99-q01)*2-1`. The two are not related by a constant:
+   the per-dimension factor `std / (half of q01..q99)` spans 0.19-0.76, and in z-score space a
+   *perfect* model can only score `err/mn = 0.708` (computed from the archive + the
+   checkpoint's own stats) — which is exactly the floor the legacy table sat on (0.827-1.032).
+   Consequences of the fix, measured on two checkpoints: `err/mn` 0.889 -> 0.457 and
+   1.032 -> 0.492 (the models do fit well), `State` 0.022 -> 0.150 and 0.466 -> 0.872,
+   `stEr` 1.00 -> 1.08 (crossing the "needed to fit" line, verdict `vision-only` -> **PASS**).
+   `--use-quantiles no` reproduces the legacy numbers to 3 decimals, so the flag is the only
+   difference. `scripts/reliance_table.py` now prints a `nrm` column and warns when a table
+   mixes mappings; missing `nrm` means legacy z-score.
 
 1. **Wrong `action_horizon`** silently degrades the fit: the same checkpoint at ah 20 vs its
    trained ah 50 went from `err/mn` 1.032 to 1.000 with `Vision` 0.037 → 0.040. Always pass the

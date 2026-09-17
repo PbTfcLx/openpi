@@ -23,6 +23,7 @@ import cv2
 import imageio
 import robocasa  # noqa: F401
 import robocasa.utils.gym_utils.gymnasium_groot  # noqa: F401
+from robocasa.models.robots import GROOT_ROBOCASA_ENVS_ROBOTS as _ROBOT_NAMES
 from robocasa.utils.env_utils import convert_action
 import gymnasium as gym
 import numpy as np
@@ -30,6 +31,21 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+
+
+# Episode length budget per task. Threshold-style tasks (drawers, stove) finish quickly, while the
+# door / coffee tasks need the mobile base to travel and reposition, so they get a longer budget.
+# This table is the single source of truth: the robocasa-eval skill reads it back out of this file.
+TASK_MAX_STEPS = {
+    "OpenDrawer": 400,
+    "CloseDrawer": 400,
+    "TurnOnStove": 400,
+    "OpenDoubleDoor": 850,
+    "CoffeeSetupMug": 500,
+    "CloseDoubleDoor": 700,
+}
+# Fallback for tasks not listed above (the value used for every task before per-task budgets existed).
+DEFAULT_MAX_STEPS = 720
 
 
 @dataclasses.dataclass
@@ -48,7 +64,9 @@ class Args:
     env_name: str = "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 100  # Number of rollouts per task
-    max_steps: int = 720
+    # Episode length budget. None = per-task default from TASK_MAX_STEPS above; set it to pin one
+    # value for every task.
+    max_steps: int | None = None
 
     #################################################################################################################
     # Utils
@@ -95,6 +113,25 @@ def get_robocasa_env_fn(
         return gym.make(env_name, enable_render=True, **kwargs)
 
     return env_fn
+
+
+def _task_name_from_env(env_name: str) -> str:
+    """``robocasa_panda_omron/OpenDrawer_PandaOmron_Env`` -> ``OpenDrawer``.
+
+    Gym ids are ``<prefix>/<Task>_<Robot>_Env`` and robot names may themselves contain underscores
+    (``Panda_Panda``, ``GR1FixedLowerBodyFourierHands``), so splitting on the last underscore is wrong.
+    Prefer the longest known task name from TASK_MAX_STEPS, then strip the trailing robot name.
+    """
+    cls = env_name.rsplit("/", 1)[-1]
+    if cls.endswith("_Env"):
+        cls = cls[: -len("_Env")]
+    for known in sorted(TASK_MAX_STEPS, key=len, reverse=True):
+        if cls == known or cls.startswith(f"{known}_"):
+            return known
+    for robot in sorted(_ROBOT_NAMES, key=len, reverse=True):
+        if cls.endswith(f"_{robot}"):
+            return cls[: -len(robot) - 1]
+    return cls
 
 
 class _FlattenActionEnv(gym.Wrapper):
@@ -563,6 +600,17 @@ def _reseed_scene_rng(env: gym.Env, seed: int) -> None:
 def eval_robocasa(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
+
+    # Resolve the episode budget before any worker is spawned (workers receive a copy of `args`).
+    task = _task_name_from_env(args.env_name)
+    if args.max_steps is None:
+        args.max_steps = TASK_MAX_STEPS.get(task, DEFAULT_MAX_STEPS)
+        logging.info(
+            f"Task {task}: max_steps={args.max_steps} (per-task default from TASK_MAX_STEPS; "
+            f"override with --args.max-steps)"
+        )
+    else:
+        logging.info(f"Task {task}: max_steps={args.max_steps} (explicit override)")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
     # Remember when this run started: the video writer needs it to distinguish
